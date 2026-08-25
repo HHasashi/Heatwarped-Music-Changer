@@ -93,7 +93,7 @@ Example:
 
 The spaces and hyphens are important.
 
-Files that don't follow this format will not be recognized.
+Files that don't follow this format will be added as custom songs at the end of the playlist.
 
 ---
 
@@ -177,7 +177,7 @@ If you only want to replace Carbon and Black, you can simply use:
 
 The other 6 stock songs will stay untouched.
 
-If your custom setlist starts directly at `09`, then **none of the 8 stock songs will be replaced**.
+If your custom setlist starts directly at `09` or has no numbered tracks, then **none of the 8 stock songs will be replaced**.
 
 ---
 
@@ -187,11 +187,11 @@ If your custom setlist starts directly at `09`, then **none of the 8 stock songs
 WARPED | event:/Music/Warped
 ```
 
-WARPED is the intro song.
-
-I made the choice to keep it permanently protected.
+WARPED is not originally discoverable in the Telefon, so I made the choice to keep the song as is.
 
 It cannot be replaced by the patcher.
+
+It is not discoverable in the Telefon.
 
 A file numbered `09` does **NOT** replace WARPED.
 
