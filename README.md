@@ -44,7 +44,7 @@ You can use:
 
 You don't need to convert the songs yourself, the patcher automatically converts them to the format required by the game.
 
-[Python 3](https://www.python.org/) is required before launching the script.
+[Python 3](https://www.python.org/) is required before launching the script if you plan on compiling this yourself. If not, I'd recommend downloading the compiled EXE files in the RELEASE section.
 
 [FFMPEG](https://www.gyan.dev/ffmpeg/builds/) and [oggvorbis2fsb5](https://github.com/uyjulian/oggvorbis2fsb5/releases/latest/) are required but will be downloaded at the first launch.
 
