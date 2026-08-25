@@ -12,11 +12,11 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import traceback
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -25,7 +25,12 @@ from typing import Iterable, Optional
 
 APP_VERSION = "1.0"
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# Avec PyInstaller --onefile, __file__ pointe vers le dossier temporaire.
+# On garde donc les dossiers du patcher a cote de l EXE.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "input"
 DEFAULT_TRACKS_DIR = SCRIPT_DIR / "tracks"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output"
@@ -1348,7 +1353,6 @@ def resolve_track_layout(
 
 def load_config(path: Path) -> dict:
     defaults = {
-        "auto_download_tools": True,
         "vorbis_quality": 6,
         "end_marker_policy": "full",
         "timeline_padding_ms": 0,
@@ -1426,51 +1430,79 @@ def find_executable(root: Path, names: set[str]) -> Optional[Path]:
     return None
 
 
-def find_or_install_ffmpeg(tools_dir: Path, auto_download: bool) -> Path:
-    bundled = find_executable(tools_dir / "ffmpeg", {"ffmpeg.exe", "ffmpeg"})
-    if bundled:
-        return bundled
-    system = shutil.which("ffmpeg")
-    if system:
-        return Path(system)
-    if not auto_download:
-        raise PatcherError("ffmpeg not found. Install it or enable auto_download_tools in config.json")
-
-    print("ffmpeg not found, downloading it...")
+def install_ffmpeg(tools_dir: Path) -> Path:
+    print("Downloading ffmpeg...")
     archive = tools_dir / "_downloads" / "ffmpeg-release-essentials.zip"
     download(FFMPEG_URL, archive)
     extract_zip(archive, tools_dir / "ffmpeg")
     archive.unlink(missing_ok=True)
     exe = find_executable(tools_dir / "ffmpeg", {"ffmpeg.exe", "ffmpeg"})
     if not exe:
-        raise PatcherError("ffmpeg archive downloaded, but ffmpeg executable was not found")
+        raise PatcherError("ffmpeg was downloaded but ffmpeg.exe was not found")
     return exe
 
 
-def find_or_install_oggvorbis2fsb5(tools_dir: Path, auto_download: bool) -> Path:
-    names = {"oggvorbis2fsb5.exe", "oggvorbis2fsb5"}
-    bundled = find_executable(tools_dir / "oggvorbis2fsb5", names)
-    if bundled:
-        return bundled
-    system = shutil.which("oggvorbis2fsb5")
-    if system:
-        return Path(system)
-    if not auto_download:
-        raise PatcherError(
-            "oggvorbis2fsb5 not found. Place it in tools/oggvorbis2fsb5/ or enable auto_download_tools"
-        )
-
-    print("oggvorbis2fsb5 not found, downloading it...")
+def install_oggvorbis2fsb5(tools_dir: Path) -> Path:
+    print("Downloading oggvorbis2fsb5...")
     archive = tools_dir / "_downloads" / "oggvorbis2fsb5-win32.zip"
     download(OGGVORBIS2FSB5_URL, archive)
     extract_zip(archive, tools_dir / "oggvorbis2fsb5")
     archive.unlink(missing_ok=True)
-    exe = find_executable(tools_dir / "oggvorbis2fsb5", names)
+    exe = find_executable(
+        tools_dir / "oggvorbis2fsb5",
+        {"oggvorbis2fsb5.exe", "oggvorbis2fsb5"},
+    )
     if not exe:
-        raise PatcherError(
-            "oggvorbis2fsb5 archive downloaded, but executable was not found"
-        )
+        raise PatcherError("oggvorbis2fsb5 was downloaded but the executable was not found")
     return exe
+
+
+def check_tools(tools_dir: Path) -> tuple[Path, Path]:
+    # Les tools sont verifies avant les inputs pour eviter de lancer le patch pour rien.
+    tools_dir.mkdir(parents=True, exist_ok=True)
+
+    ffmpeg = find_executable(tools_dir / "ffmpeg", {"ffmpeg.exe", "ffmpeg"})
+    ogg_tool = find_executable(
+        tools_dir / "oggvorbis2fsb5",
+        {"oggvorbis2fsb5.exe", "oggvorbis2fsb5"},
+    )
+
+    missing = []
+    if ffmpeg is None:
+        missing.append("ffmpeg")
+    if ogg_tool is None:
+        missing.append("oggvorbis2fsb5")
+
+    if not missing:
+        print("Tools: OK")
+        return ffmpeg, ogg_tool
+
+    print("Missing tools: " + ", ".join(missing))
+    while True:
+        try:
+            answer = input("Download missing tools now? (y/n): ").strip().lower()
+        except EOFError:
+            answer = "n"
+
+        if answer in {"y", "yes"}:
+            break
+        if answer in {"n", "no"}:
+            raise PatcherError(
+                "The required tools are missing.\n"
+                "Download them first and keep this folder structure:\n"
+                "  tools\\ffmpeg\\...\\ffmpeg.exe\n"
+                "  tools\\oggvorbis2fsb5\\oggvorbis2fsb5.exe\n"
+                "Then run the patcher again."
+            )
+        print("Please answer y or n.")
+
+    if ffmpeg is None:
+        ffmpeg = install_ffmpeg(tools_dir)
+    if ogg_tool is None:
+        ogg_tool = install_oggvorbis2fsb5(tools_dir)
+
+    print("Tools: OK")
+    return ffmpeg, ogg_tool
 
 
 def run_command(args: list[str], cwd: Optional[Path] = None) -> None:
@@ -2374,15 +2406,28 @@ def _fmod_list_count(bank: bytes | bytearray, list_type: bytes, search_end: int)
     return u32(bank, children_start + 8)
 
 
-def patch(
+def check_patch_files(
     master_bank: Path,
     sharedassets_path: Path,
     resources_path: Path,
     tracks_dir: Path,
-    output_dir: Path,
-    tools_dir: Path,
-    config: dict,
-) -> None:
+) -> dict[int, TrackReplacement]:
+    if not master_bank.exists():
+        raise PatcherError(
+            f"Missing input file: {master_bank}\n"
+            "Copy Heatwarped_Data\\StreamingAssets\\Master.bank into the input folder."
+        )
+    if not sharedassets_path.exists():
+        raise PatcherError(
+            f"Missing input file: {sharedassets_path}\n"
+            "Copy Heatwarped_Data\\sharedassets0.assets into the input folder."
+        )
+    if not resources_path.exists():
+        raise PatcherError(
+            f"Missing input file: {resources_path}\n"
+            "Copy Heatwarped_Data\\resources.assets into the input folder."
+        )
+
     input_replacements = scan_tracks(tracks_dir)
     if not input_replacements:
         raise PatcherError(
@@ -2390,21 +2435,22 @@ def patch(
             "Use 01-08 to replace stock music, or 09-99 to add custom tracks. "
             "Example: 09 - Linkin Park - Faint.mp3"
         )
+    return input_replacements
+
+
+def patch(
+    master_bank: Path,
+    sharedassets_path: Path,
+    resources_path: Path,
+    input_replacements: dict[int, TrackReplacement],
+    output_dir: Path,
+    ffmpeg: Path,
+    ogg_tool: Path,
+    config: dict,
+) -> None:
     replacements, stock_replacements, custom_replacements, custom_input_map = resolve_track_layout(
         input_replacements
     )
-    if not master_bank.exists():
-        raise PatcherError(f"Missing input file: {master_bank}")
-    if not sharedassets_path.exists():
-        raise PatcherError(
-            f"Missing input file: {sharedassets_path}\n"
-            "Copy Heatwarped_Data\\sharedassets0.assets into the patcher's input folder."
-        )
-    if not resources_path.exists():
-        raise PatcherError(
-            f"Missing input file: {resources_path}\n"
-            "Copy Heatwarped_Data\\resources.assets into the patcher's input folder."
-        )
 
     raw = master_bank.read_bytes()
     original_sha = hashlib.sha256(raw).hexdigest()
@@ -2426,16 +2472,12 @@ def patch(
     protected_original_sample = fsb.samples[protected_idx]
     protected_original_timeline = timelines[protected_idx]
 
-    auto_download = bool(config.get("auto_download_tools", True))
     quality = int(config.get("vorbis_quality", 6))
     quality = max(-1, min(10, quality))
     policy = str(config.get("end_marker_policy", "full")).lower()
     padding_ms = int(config.get("timeline_padding_ms", 0))
     padding_samples = max(0, round(padding_ms * 48))
     free_roam_mode = str(config.get("free_roam_playlist", "partial")).lower()
-
-    ffmpeg = find_or_install_ffmpeg(tools_dir, auto_download)
-    ogg_tool = find_or_install_oggvorbis2fsb5(tools_dir, auto_download)
 
     patched_bank_metadata = bytearray(raw)
     manifest_tracks: list[dict] = []
@@ -2807,17 +2849,25 @@ def main() -> int:
     print(f"Input: {DEFAULT_INPUT_DIR}")
 
     try:
-        if not args.master.exists():
-            raise PatcherError(
-                f"Master.bank not found: {args.master}\n"
-                "Put the original file in the input/ folder."
-            )
-
+        # Ordre du pre-check : tools -> inputs/tracks -> config -> patch.
+        ffmpeg, ogg_tool = check_tools(args.tools)
+        input_replacements = check_patch_files(
+            args.master, args.sharedassets, args.resources, args.tracks
+        )
 
         config = load_config(args.config)
         if args.free_roam is not None:
             config["free_roam_playlist"] = args.free_roam
-        patch(args.master, args.sharedassets, args.resources, args.tracks, args.output, args.tools, config)
+        patch(
+            args.master,
+            args.sharedassets,
+            args.resources,
+            input_replacements,
+            args.output,
+            ffmpeg,
+            ogg_tool,
+            config,
+        )
         return 0
     except PatcherError as exc:
         print("\nERROR:", exc, file=sys.stderr)
@@ -2827,5 +2877,23 @@ def main() -> int:
         return 130
 
 
+def run() -> int:
+    code = 1
+    try:
+        code = main()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+    except BaseException:
+        traceback.print_exc()
+        code = 1
+    finally:
+        if getattr(sys, "frozen", False):
+            try:
+                input("\nPress Enter to close...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+    return code
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

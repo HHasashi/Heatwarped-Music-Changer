@@ -1,8 +1,11 @@
 {
-  "auto_download_tools": true,
-  "vorbis_quality": 6,
+  "vorbis_quality": 10,
   "end_marker_policy": "full",
   "timeline_padding_ms": 0,
-
+  "_comment": [
+    "stock   = only the stock Free Roam playlist length (songs 2-3-4)",
+    "partial = songs 2-3-4 + all custom songs above 8",
+    "full    = all Jukebox songs + all custom songs"
+  ],
   "free_roam_playlist": "partial"
 }
