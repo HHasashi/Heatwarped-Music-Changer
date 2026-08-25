@@ -99,7 +99,9 @@ Files that don't follow this format will not be recognized.
 
 ## 3. Run the patcher
 
-You can run the patched via the ```RUN_PATCHER.bat``` (RECOMMENDED) or via this command line :
+I'd recommend downloading the compiled EXE files in the RELEASE section, but in case you don't or the EXE does not work because I'm careless...
+
+You can run the patched via the ```RUN_PATCHER.bat``` or via this command line :
 
 ```text
 py -3 heatwarped_patcher.py
