@@ -1,0 +1,4 @@
+Put the original files here :
+ - Master.bank
+ - resources.assets
+ - sharedassets0.assets
