@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Patcher de musiques pour Heatwarped.
 
-Format des pistes : NN - Artiste - Titre.ext
+Format conseillé : NN - Artiste - Titre.ext
 01-08 remplacent les pistes du jeu, 09-99 ajoutent des pistes custom.
+Les fichiers audio sans numéro sont ajoutés à la fin.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.0.1"
 
 # Avec PyInstaller --onefile, __file__ pointe vers le dossier temporaire.
 # On garde donc les dossiers du patcher a cote de l EXE.
@@ -205,7 +206,7 @@ class Fsb5:
 
 @dataclass
 class TrackReplacement:
-    slot: int
+    slot: Optional[int]
     artist: str
     title: str
     source: Path
@@ -1296,55 +1297,95 @@ def validate_heatwarped_bank(fsb: Fsb5, allow_extra: bool = False) -> None:
         )
 
 
+def _parse_artist_title(parts: list[str]) -> tuple[str, str]:
+    # On vire les tags de version peu importe leur position.
+    cleaned = [
+        part.strip() for part in parts
+        if part.strip()
+        and "remaster" not in part.casefold()
+        and "remix" not in part.casefold()
+    ]
+
+    # Pas de détection intelligente : premier champ = artiste, le reste = nom.
+    if len(cleaned) >= 2:
+        return cleaned[0], " - ".join(cleaned[1:])
+    if cleaned:
+        return "", cleaned[0]
+    return "", ""
+
+
 def parse_track_filename(path: Path) -> Optional[TrackReplacement]:
     if path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return None
-    m = FILENAME_RE.match(path.stem)
-    if not m:
-        raise PatcherError(
-            f"Invalid track filename: {path.name}\n"
-            "Expected: NN - Artist - Title.ext  (example: 01 - Avenged Sevenfold - Blinded in Chains.mp3)"
-        )
-    slot = int(m.group("slot"))
-    if slot < 1 or slot > 99:
-        raise PatcherError(f"Track {path.name}: number must be between 01 and 99")
-    artist = m.group("artist").strip()
-    title = m.group("title").strip()
-    if not artist or not title:
-        raise PatcherError(f"Track {path.name}: artist/title cannot be empty")
-    return TrackReplacement(slot, artist, title, path)
+
+    name = path.stem.strip()
+    m = FILENAME_RE.match(name)
+    if m:
+        slot = int(m.group("slot"))
+        parts = [m.group("artist"), *m.group("title").split(" - ")]
+        artist, title = _parse_artist_title(parts)
+        if 1 <= slot <= 99 and artist and title:
+            return TrackReplacement(slot, artist, title, path)
+
+    # Pas de numéro valide : la piste sera ajoutée à la fin.
+    parts = [part.strip() for part in name.split(" - ") if part.strip()]
+
+    # Si le fichier commence par un numéro invalide (00, 100...), on l'ignore.
+    if parts and parts[0].isdigit():
+        parts = parts[1:]
+
+    artist, title = _parse_artist_title(parts)
+    if not title:
+        title = name
+
+    return TrackReplacement(None, artist, title, path)
 
 
 def scan_tracks(tracks_dir: Path) -> dict[int, TrackReplacement]:
     if not tracks_dir.exists():
         tracks_dir.mkdir(parents=True, exist_ok=True)
+
     replacements: dict[int, TrackReplacement] = {}
+    unnumbered: list[TrackReplacement] = []
+
     for path in sorted(tracks_dir.iterdir(), key=lambda p: p.name.casefold()):
         if not path.is_file() or path.name.startswith("."):
             continue
+
         repl = parse_track_filename(path)
         if repl is None:
             continue
+
+        if repl.slot is None:
+            unnumbered.append(repl)
+            continue
+
         if repl.slot in replacements:
             raise PatcherError(
                 f"Duplicate slot {repl.slot:02d}:\n  {replacements[repl.slot].source.name}\n  {path.name}"
             )
         replacements[repl.slot] = repl
+
+    # Les fichiers sans numéro passent après tous les 01-99.
+    for key, repl in enumerate(unnumbered, start=100):
+        replacements[key] = repl
+
     return replacements
 
 
 def resolve_track_layout(
     input_replacements: dict[int, TrackReplacement],
 ) -> tuple[dict[int, TrackReplacement], dict[int, TrackReplacement], dict[int, TrackReplacement], dict[int, int]]:
-    """Sépare les remplacements 01-08 des customs 09-99."""
+    """Sépare les remplacements stock des pistes custom."""
     stock = {s: r for s, r in input_replacements.items() if 1 <= s <= 8}
     custom_inputs = sorted((s, r) for s, r in input_replacements.items() if s >= 9)
 
     custom: dict[int, TrackReplacement] = {}
     input_to_internal: dict[int, int] = {}
-    for internal_slot, (input_number, repl) in enumerate(custom_inputs, start=10):
+    for internal_slot, (_, repl) in enumerate(custom_inputs, start=10):
         custom[internal_slot] = repl
-        input_to_internal[input_number] = internal_slot
+        if repl.slot is not None:
+            input_to_internal[repl.slot] = internal_slot
 
     resolved = dict(stock)
     resolved.update(custom)
@@ -1531,7 +1572,14 @@ def build_donor_fsb(
     quality: int,
     temp_dir: Path,
 ) -> FsbSample:
-    safe_base = f"slot_{repl.slot:02d}"
+    # Les pistes AUTO n'ont pas de numero d'entree.
+    # On utilise un identifiant court basé sur le nom du fichier pour les fichiers temporaires.
+    if repl.slot is None:
+        auto_id = hashlib.sha256(repl.source.name.encode("utf-8")).hexdigest()[:8]
+        safe_base = f"auto_{auto_id}"
+    else:
+        safe_base = f"slot_{repl.slot:02d}"
+
     ogg_path = temp_dir / f"{safe_base}.ogg"
     fsb_path = temp_dir / f"{safe_base}.fsb"
 
@@ -2432,8 +2480,8 @@ def check_patch_files(
     if not input_replacements:
         raise PatcherError(
             f"No tracks found in {tracks_dir}\n"
-            "Use 01-08 to replace stock music, or 09-99 to add custom tracks. "
-            "Example: 09 - Linkin Park - Faint.mp3"
+            "Use 01-08 to replace stock music, 09-99 to order custom tracks, "
+            "or just drop supported audio files in the folder to append them at the end."
         )
     return input_replacements
 
@@ -2500,7 +2548,9 @@ def patch(
                 slot_info = SLOT_BY_NUMBER[slot]
                 print(f"[{slot:02d}] {slot_info['sample_name']} <- {repl.artist} - {repl.title}")
             else:
-                print(f"[{repl.slot:02d} -> {slot:02d}] custom <- {repl.artist} - {repl.title}")
+                source_slot = f"{repl.slot:02d}" if repl.slot is not None else "AUTO"
+                label = f"{repl.artist} - {repl.title}" if repl.artist else repl.title
+                print(f"[{source_slot} -> {slot:02d}] custom <- {label}")
 
             donor = build_donor_fsb(repl, ffmpeg, ogg_tool, quality, temp_dir)
 
@@ -2616,7 +2666,7 @@ def patch(
             )
             report_lines.extend(
                 [
-                    f"{repl.slot:02d} -> {slot:02d} CUSTOM",
+                    f"{f'{repl.slot:02d}' if repl.slot is not None else 'AUTO'} -> {slot:02d} CUSTOM",
                     f"  file: {repl.source.name}",
                     f"  FSB: #{idx}",
                     f"  length: {duration:.3f}s",
@@ -2791,12 +2841,13 @@ def patch(
         "slot_policy": {
             "01-08": "stock replacement",
             "09-99": "custom order, compacted to internal slots 10+",
+            "unnumbered": "custom tracks appended after all numbered files",
             "WARPED": "protected",
         },
         "custom_input_to_internal_slot": {
             f"{k:02d}": v for k, v in sorted(custom_input_map.items())
         },
-        "display_metadata_note": "01-08 replace stock tracks; 09-99 are compacted custom tracks.",
+        "display_metadata_note": "01-08 replace stock tracks; 09-99 are compacted custom tracks; unnumbered audio files are appended last.",
         "protected_track": {
             "slot": PROTECTED_MUSIC_SLOT["slot"],
             "base_sample": PROTECTED_MUSIC_SLOT["sample_name"],
