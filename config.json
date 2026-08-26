@@ -1,11 +1,21 @@
 {
+  "_comment": 
+  [
+    "stock = keep all playlists unchanged",
+    "full = all 8 Telefon songs + all custom songs in every playlist",
+    "normalization_mode = lufs, peak or off",
+    "target_lufs and true_peak are used in lufs mode",
+    "target_peak_dbfs is used in peak mode",
+    "off = no volume normalization"
+  ],
+
   "vorbis_quality": 10,
   "end_marker_policy": "full",
   "timeline_padding_ms": 0,
-  "_comment": [
-    "stock   = only the stock Free Roam playlist length (songs 2-3-4)",
-    "partial = songs 2-3-4 + all custom songs above 8",
-    "full    = all Jukebox songs + all custom songs"
-  ],
-  "free_roam_playlist": "partial"
+  "normalization_mode": "lufs",
+  "target_lufs": -9.0,
+  "true_peak": -1.0,
+  "target_peak_dbfs": 0.0,
+  "fetch_metadata": true,
+  "playlist_mode": "full"
 }

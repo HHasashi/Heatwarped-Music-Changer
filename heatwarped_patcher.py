@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "2.0"
 
 # Avec PyInstaller --onefile, __file__ pointe vers le dossier temporaire.
 # On garde donc les dossiers du patcher a cote de l EXE.
@@ -941,6 +942,68 @@ def _validate_custom_graph_topology(
                 )
 
 
+def _set_master_bus_item_gain(item: bytes, gain_db: float = 0.0) -> bytes:
+    data = bytearray(item)
+    bus_chunks = []
+    for _, cid, ps, pe in iter_chunks(data, 12, len(data)):
+        if cid == b"BUS ":
+            bus_chunks.append((ps, pe))
+
+    if len(bus_chunks) != 1:
+        raise PatcherError(f"Expected one BUS chunk in Master Bus, found {len(bus_chunks)}")
+
+    ps, pe = bus_chunks[0]
+    if pe - ps < 18:
+        raise PatcherError("Master Bus BUS chunk is too small")
+
+    struct.pack_into("<f", data, ps + 14, float(gain_db))
+    return bytes(data)
+
+
+def _master_track_guid_for_timeline(
+    bank: bytes | bytearray, timeline_guid: bytes, search_end: int
+) -> bytes:
+    event = _extract_list_item_containing_guid(bank, b"EVTS", timeline_guid, search_end)
+    for _, cid, ps, pe in iter_chunks(event, 12, len(event)):
+        if cid != b"EVTB":
+            continue
+        if pe - ps < 80:
+            raise PatcherError("EVTB chunk is too small to read its Master Track")
+        if bytes(event[ps + 32 : ps + 48]) != timeline_guid:
+            continue
+        return bytes(event[ps + 64 : ps + 80])
+    raise PatcherError("Could not find the Master Track for this music event")
+
+
+def set_music_event_gain_db(
+    bank: bytearray, timeline_guid: bytes, gain_db: float = 0.0
+) -> None:
+    fsb_off = bank.find(b"FSB5")
+    if fsb_off < 0:
+        raise PatcherError("FSB missing while patching music gain")
+
+    master_guid = _master_track_guid_for_timeline(bank, timeline_guid, fsb_off)
+    _, _, children_start, children_end = find_list_node(bank, b"MBSS", fsb_off)
+    matches = []
+
+    for off, cid, ps, pe in iter_chunks(bank, children_start, children_end):
+        if cid != b"LIST" or master_guid not in bank[off:pe]:
+            continue
+        for _, child_id, cps, cpe in iter_chunks(bank, ps + 4, pe):
+            if child_id == b"BUS ":
+                matches.append((cps, cpe))
+
+    if len(matches) != 1:
+        raise PatcherError(
+            f"Expected one Master Bus for GUID {master_guid.hex()}, found {len(matches)}"
+        )
+
+    ps, pe = matches[0]
+    if pe - ps < 18:
+        raise PatcherError("Master Bus BUS chunk is too small")
+    struct.pack_into("<f", bank, ps + 14, float(gain_db))
+
+
 def clone_custom_music_graphs(
     original_bank: bytes,
     bank: bytearray,
@@ -1010,6 +1073,7 @@ def clone_custom_music_graphs(
 
         ibus = _replace_exact_guid(input_bus_template, CARBON_INPUT_BUS_GUID, graph.input_bus_guid)
         mbus = _replace_exact_guid(master_bus_template, CARBON_MASTER_TRACK_GUID, graph.master_track_guid)
+        mbus = _set_master_bus_item_gain(mbus, 0.0)
         gbus = _replace_exact_guid(group_bus_template, CARBON_NONMASTER_TRACK_GUID, graph.nonmaster_track_guid)
         gbus = _replace_exact_guid(gbus, CARBON_MASTER_TRACK_GUID, graph.master_track_guid)
 
@@ -1297,16 +1361,23 @@ def validate_heatwarped_bank(fsb: Fsb5, allow_extra: bool = False) -> None:
         )
 
 
-def _parse_artist_title(parts: list[str]) -> tuple[str, str]:
+def _clean_name_parts(parts: list[str]) -> list[str]:
     # On vire les tags de version peu importe leur position.
-    cleaned = [
+    return [
         part.strip() for part in parts
         if part.strip()
         and "remaster" not in part.casefold()
         and "remix" not in part.casefold()
     ]
 
-    # Pas de détection intelligente : premier champ = artiste, le reste = nom.
+
+def _parse_artist_title(parts: list[str], permissive: bool = False) -> tuple[str, str]:
+    cleaned = _clean_name_parts(parts)
+
+    # Pour un nom non numéroté, plus de 2 champs = ambigu : on ne devine pas l'artiste.
+    if permissive and len(cleaned) > 2:
+        return "", " - ".join(cleaned)
+
     if len(cleaned) >= 2:
         return cleaned[0], " - ".join(cleaned[1:])
     if cleaned:
@@ -1324,72 +1395,98 @@ def parse_track_filename(path: Path) -> Optional[TrackReplacement]:
         slot = int(m.group("slot"))
         parts = [m.group("artist"), *m.group("title").split(" - ")]
         artist, title = _parse_artist_title(parts)
-        if 1 <= slot <= 99 and artist and title:
+        if 1 <= slot <= 99 and title:
             return TrackReplacement(slot, artist, title, path)
 
-    # Pas de numéro valide : la piste sera ajoutée à la fin.
+    # Pas de nomenclature exploitable : on accepte quand même le fichier en custom AUTO.
     parts = [part.strip() for part in name.split(" - ") if part.strip()]
-
-    # Si le fichier commence par un numéro invalide (00, 100...), on l'ignore.
     if parts and parts[0].isdigit():
         parts = parts[1:]
 
-    artist, title = _parse_artist_title(parts)
+    artist, title = _parse_artist_title(parts, permissive=True)
     if not title:
-        title = name
+        title = name or path.name
 
     return TrackReplacement(None, artist, title, path)
 
 
-def scan_tracks(tracks_dir: Path) -> dict[int, TrackReplacement]:
+def scan_tracks(tracks_dir: Path) -> list[TrackReplacement]:
     if not tracks_dir.exists():
         tracks_dir.mkdir(parents=True, exist_ok=True)
 
-    replacements: dict[int, TrackReplacement] = {}
-    unnumbered: list[TrackReplacement] = []
-
+    tracks: list[TrackReplacement] = []
     for path in sorted(tracks_dir.iterdir(), key=lambda p: p.name.casefold()):
         if not path.is_file() or path.name.startswith("."):
             continue
-
         repl = parse_track_filename(path)
-        if repl is None:
-            continue
-
-        if repl.slot is None:
-            unnumbered.append(repl)
-            continue
-
-        if repl.slot in replacements:
-            raise PatcherError(
-                f"Duplicate slot {repl.slot:02d}:\n  {replacements[repl.slot].source.name}\n  {path.name}"
-            )
-        replacements[repl.slot] = repl
-
-    # Les fichiers sans numéro passent après tous les 01-99.
-    for key, repl in enumerate(unnumbered, start=100):
-        replacements[key] = repl
-
-    return replacements
+        if repl is not None:
+            tracks.append(repl)
+    return tracks
 
 
 def resolve_track_layout(
-    input_replacements: dict[int, TrackReplacement],
-) -> tuple[dict[int, TrackReplacement], dict[int, TrackReplacement], dict[int, TrackReplacement], dict[int, int]]:
-    """Sépare les remplacements stock des pistes custom."""
-    stock = {s: r for s, r in input_replacements.items() if 1 <= s <= 8}
-    custom_inputs = sorted((s, r) for s, r in input_replacements.items() if s >= 9)
+    input_replacements: list[TrackReplacement],
+) -> tuple[dict[int, TrackReplacement], dict[int, TrackReplacement], dict[int, TrackReplacement], list[dict]]:
+    """Sépare les remplacements stock des pistes custom sans rejeter les doublons."""
+    stock: dict[int, TrackReplacement] = {}
+    duplicate_stock: list[TrackReplacement] = []
+    numbered_custom: list[TrackReplacement] = []
+    unnumbered: list[TrackReplacement] = []
+
+    for repl in input_replacements:
+        if repl.slot is None:
+            unnumbered.append(repl)
+        elif 1 <= repl.slot <= 8:
+            if repl.slot not in stock:
+                stock[repl.slot] = repl
+            else:
+                duplicate_stock.append(repl)
+        else:
+            numbered_custom.append(repl)
+
+    # Les doublons 01-08 deviennent les premiers customs.
+    # Ensuite viennent les 09-99 dans l'ordre numérique, puis les AUTO.
+    duplicate_stock.sort(key=lambda r: (r.slot or 0, r.source.name.casefold()))
+    numbered_custom.sort(key=lambda r: (r.slot or 0, r.source.name.casefold()))
+    unnumbered.sort(key=lambda r: r.source.name.casefold())
+    custom_order = duplicate_stock + numbered_custom + unnumbered
 
     custom: dict[int, TrackReplacement] = {}
-    input_to_internal: dict[int, int] = {}
-    for internal_slot, (_, repl) in enumerate(custom_inputs, start=10):
+    input_to_internal: list[dict] = []
+    for internal_slot, repl in enumerate(custom_order, start=10):
         custom[internal_slot] = repl
-        if repl.slot is not None:
-            input_to_internal[repl.slot] = internal_slot
+        input_to_internal.append({
+            "input_slot": repl.slot,
+            "internal_slot": internal_slot,
+            "source": repl.source.name,
+            "stock_duplicate": repl in duplicate_stock,
+        })
 
     resolved = dict(stock)
     resolved.update(custom)
     return resolved, stock, custom, input_to_internal
+
+
+def _config_bool(value, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise PatcherError(f"config {key} must be true or false")
+
+
+def _config_float(value, key: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PatcherError(f"config {key} must be a number") from exc
+    if not math.isfinite(number):
+        raise PatcherError(f"config {key} must be a finite number")
+    return number
 
 
 def load_config(path: Path) -> dict:
@@ -1397,7 +1494,12 @@ def load_config(path: Path) -> dict:
         "vorbis_quality": 6,
         "end_marker_policy": "full",
         "timeline_padding_ms": 0,
-        "free_roam_playlist": "partial",
+        "playlist_mode": "full",
+        "normalization_mode": "lufs",
+        "target_lufs": -9.0,
+        "true_peak": -1.0,
+        "target_peak_dbfs": 0.0,
+        "fetch_metadata": False,
     }
     if not path.exists():
         return defaults
@@ -1413,8 +1515,17 @@ def load_config(path: Path) -> dict:
         )
     defaults["end_marker_policy"] = policy
 
-    free_roam = str(defaults.get("free_roam_playlist", "partial")).lower().strip()
-    free_roam_aliases = {
+    # Ancien config : stock reste stock, partial/full deviennent le nouveau full.
+    if "playlist_mode" in user:
+        raw_playlist_mode = user["playlist_mode"]
+    elif "free_roam_playlist" in user:
+        legacy_mode = str(user["free_roam_playlist"]).lower().strip()
+        raw_playlist_mode = "stock" if legacy_mode in {"stock", "none", "off", "disabled", "native"} else "full"
+    else:
+        raw_playlist_mode = "full"
+
+    playlist_mode = str(raw_playlist_mode).lower().strip()
+    playlist_aliases = {
         "none": "stock",
         "off": "stock",
         "disabled": "stock",
@@ -1422,10 +1533,57 @@ def load_config(path: Path) -> dict:
         "all": "full",
         "unlocked": "full",
     }
-    free_roam = free_roam_aliases.get(free_roam, free_roam)
-    if free_roam not in {"stock", "partial", "full"}:
-        raise PatcherError("config free_roam_playlist must be: stock, partial, or full")
-    defaults["free_roam_playlist"] = free_roam
+    playlist_mode = playlist_aliases.get(playlist_mode, playlist_mode)
+    if playlist_mode not in {"stock", "full"}:
+        raise PatcherError("config playlist_mode must be: stock or full")
+    defaults["playlist_mode"] = playlist_mode
+
+    # Nouveau système : LUFS ou peak. L'ancien normalize_tracks reste accepté
+    # pour ne pas casser un ancien config.
+    if "normalization_mode" in user:
+        raw_normalization_mode = user["normalization_mode"]
+    elif "normalize_tracks" in user:
+        raw_normalization_mode = "peak" if _config_bool(user["normalize_tracks"], "normalize_tracks") else "off"
+    else:
+        raw_normalization_mode = "lufs"
+
+    normalization_mode = str(raw_normalization_mode).lower().strip()
+    normalization_aliases = {
+        "loudness": "lufs",
+        "dbfs": "peak",
+        "none": "off",
+        "disabled": "off",
+        "false": "off",
+    }
+    normalization_mode = normalization_aliases.get(normalization_mode, normalization_mode)
+    if normalization_mode not in {"lufs", "peak", "off"}:
+        raise PatcherError("config normalization_mode must be: lufs, peak, or off")
+    defaults["normalization_mode"] = normalization_mode
+
+    target_lufs = -9.0
+    true_peak = -1.0
+    target_peak_dbfs = 0.0
+
+    if normalization_mode == "lufs":
+        target_lufs = _config_float(defaults.get("target_lufs", -9.0), "target_lufs")
+        true_peak = _config_float(defaults.get("true_peak", -1.0), "true_peak")
+        if not -70.0 <= target_lufs <= -5.0:
+            raise PatcherError("config target_lufs must be between -70 and -5")
+        if not -9.0 <= true_peak <= 0.0:
+            raise PatcherError("config true_peak must be between -9 and 0")
+    elif normalization_mode == "peak":
+        target_peak_dbfs = _config_float(
+            defaults.get("target_peak_dbfs", 0.0), "target_peak_dbfs"
+        )
+        if not -60.0 <= target_peak_dbfs <= 0.0:
+            raise PatcherError("config target_peak_dbfs must be between -60 and 0")
+
+    defaults["target_lufs"] = target_lufs
+    defaults["true_peak"] = true_peak
+    defaults["target_peak_dbfs"] = target_peak_dbfs
+    defaults["fetch_metadata"] = _config_bool(defaults.get("fetch_metadata", False), "fetch_metadata")
+    defaults.pop("normalize_tracks", None)
+    defaults.pop("free_roam_playlist", None)
     return defaults
 
 
@@ -1546,7 +1704,7 @@ def check_tools(tools_dir: Path) -> tuple[Path, Path]:
     return ffmpeg, ogg_tool
 
 
-def run_command(args: list[str], cwd: Optional[Path] = None) -> None:
+def run_command(args: list[str], cwd: Optional[Path] = None) -> str:
     result = subprocess.run(
         args,
         cwd=str(cwd) if cwd else None,
@@ -1563,6 +1721,174 @@ def run_command(args: list[str], cwd: Optional[Path] = None) -> None:
             + "\n\n"
             + result.stdout[-5000:]
         )
+    return result.stdout
+
+
+def _unescape_ffmetadata(value: str) -> str:
+    out = []
+    i = 0
+    while i < len(value):
+        if value[i] == "\\" and i + 1 < len(value):
+            i += 1
+            escaped = value[i]
+            out.append("\n" if escaped == "n" else escaped)
+        else:
+            out.append(value[i])
+        i += 1
+    return "".join(out).strip()
+
+
+def fetch_audio_metadata(source: Path, ffmpeg: Path) -> Optional[tuple[str, str]]:
+    # FFmpeg sait lire les tags des formats supportés, pas besoin d'une dépendance Python en plus.
+    try:
+        output = run_command([
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(source),
+            "-f", "ffmetadata",
+            "-",
+        ])
+    except PatcherError:
+        return None
+
+    tags: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line or line.startswith(";") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().casefold()
+        if key in {"artist", "title"} and key not in tags:
+            tags[key] = _unescape_ffmetadata(value)
+
+    artist = tags.get("artist", "").strip()
+    title = tags.get("title", "").strip()
+    return (artist, title) if artist or title else None
+
+
+def _same_display_text(a: str, b: str) -> bool:
+    # Comparaison souple pour éviter Artist == Title à cause de casse/espaces/tirets.
+    def key(value: str) -> str:
+        return re.sub(r"[^\w]+", "", value.casefold(), flags=re.UNICODE)
+
+    ka = key(a)
+    kb = key(b)
+    return bool(ka and kb and ka == kb)
+
+
+def merge_track_metadata(repl: TrackReplacement, metadata: Optional[tuple[str, str]]) -> None:
+    if metadata is None:
+        if _same_display_text(repl.artist, repl.title):
+            repl.artist = ""
+        return
+
+    meta_artist, meta_title = (part.strip() for part in metadata)
+    file_artist = repl.artist.strip()
+    file_title = repl.title.strip()
+
+    if meta_artist and meta_title:
+        artist, title = meta_artist, meta_title
+    elif meta_artist:
+        # Si le filename est inversé, on prend le champ différent de l'artiste connu.
+        candidates = [file_title, file_artist]
+        title = next((x for x in candidates if x and not _same_display_text(x, meta_artist)), "")
+        if title:
+            artist = meta_artist
+        else:
+            # Pas de titre fiable : on affiche la seule info connue une seule fois.
+            artist, title = "", meta_artist
+    elif meta_title:
+        # Même logique dans l'autre sens : on cherche un artiste différent du titre connu.
+        candidates = [file_artist, file_title]
+        artist = next((x for x in candidates if x and not _same_display_text(x, meta_title)), "")
+        title = meta_title
+    else:
+        artist, title = file_artist, file_title
+
+    if not title:
+        title = file_title or file_artist or repl.source.stem.strip() or repl.source.name
+
+    if _same_display_text(artist, title):
+        artist = ""
+
+    repl.artist = artist
+    repl.title = title
+
+
+def measure_peak_db(source: Path, ffmpeg: Path) -> Optional[float]:
+    output = run_command(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(source),
+            "-map",
+            "0:a:0",
+            "-af",
+            "aformat=sample_rates=48000:channel_layouts=stereo,astats=metadata=0:reset=0",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+
+    peaks = []
+    for match in re.finditer(r"Peak level dB:\s*(-?inf|[-+]?\d+(?:\.\d+)?)", output, re.IGNORECASE):
+        value = match.group(1).lower()
+        if value == "-inf":
+            continue
+        peaks.append(float(value))
+
+    return max(peaks) if peaks else None
+
+
+def measure_loudnorm(
+    source: Path,
+    ffmpeg: Path,
+    target_lufs: float,
+    true_peak: float,
+) -> Optional[dict[str, float]]:
+    # Première passe loudnorm pour une normalisation LUFS reproductible.
+    output = run_command(
+        [
+            str(ffmpeg),
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(source),
+            "-map",
+            "0:a:0",
+            "-af",
+            (
+                "aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"loudnorm=I={target_lufs:.3f}:TP={true_peak:.3f}:LRA=11:print_format=json"
+            ),
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+
+    matches = re.findall(r'\{\s*"input_i".*?\}', output, flags=re.DOTALL)
+    if not matches:
+        return None
+
+    try:
+        raw = json.loads(matches[-1])
+        values = {
+            "input_i": float(raw["input_i"]),
+            "input_tp": float(raw["input_tp"]),
+            "input_lra": float(raw["input_lra"]),
+            "input_thresh": float(raw["input_thresh"]),
+            "target_offset": float(raw["target_offset"]),
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not all(math.isfinite(value) for value in values.values()):
+        return None
+    return values
 
 
 def build_donor_fsb(
@@ -1571,6 +1897,10 @@ def build_donor_fsb(
     ogg_tool: Path,
     quality: int,
     temp_dir: Path,
+    normalization_mode: str,
+    target_lufs: float,
+    true_peak: float,
+    target_peak_dbfs: float,
 ) -> FsbSample:
     # Les pistes AUTO n'ont pas de numero d'entree.
     # On utilise un identifiant court basé sur le nom du fichier pour les fichiers temporaires.
@@ -1586,29 +1916,72 @@ def build_donor_fsb(
 
     
     # Tout passe en Vorbis stéréo 48 kHz avant insertion.
-    run_command(
-        [
-            str(ffmpeg),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(repl.source),
-            "-map_metadata",
-            "-1",
-            "-vn",
-            "-ac",
-            "2",
-            "-ar",
-            "48000",
-            "-c:a",
-            "libvorbis",
-            "-q:a",
-            str(quality),
-            str(ogg_path),
-        ]
-    )
+    audio_filter: Optional[str] = None
+
+    if normalization_mode == "lufs":
+        measured = measure_loudnorm(repl.source, ffmpeg, target_lufs, true_peak)
+        if measured is None:
+            print("  level: LUFS unknown, unchanged")
+        else:
+            print(
+                f"  level: {measured['input_i']:+.2f} LUFS -> {target_lufs:+.2f} LUFS "
+                f"(TP {true_peak:+.2f} dBTP)"
+            )
+            audio_filter = (
+                "aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"loudnorm=I={target_lufs:.3f}:TP={true_peak:.3f}:LRA=11:"
+                f"measured_I={measured['input_i']:.6f}:"
+                f"measured_TP={measured['input_tp']:.6f}:"
+                f"measured_LRA={measured['input_lra']:.6f}:"
+                f"measured_thresh={measured['input_thresh']:.6f}:"
+                f"offset={measured['target_offset']:.6f}:linear=true:print_format=summary"
+            )
+    elif normalization_mode == "peak":
+        peak_db = measure_peak_db(repl.source, ffmpeg)
+        boost_db = (
+            max(0.0, target_peak_dbfs - peak_db)
+            if peak_db is not None
+            else 0.0
+        )
+        if peak_db is None:
+            print("  level: peak unknown, unchanged")
+        elif boost_db > 0.0001:
+            print(
+                f"  level: {peak_db:+.2f} dBFS -> {target_peak_dbfs:+.2f} dBFS "
+                f"(+{boost_db:.2f} dB)"
+            )
+            audio_filter = f"volume={boost_db:.6f}dB"
+        else:
+            print(f"  level: {peak_db:+.2f} dBFS -> unchanged")
+    else:
+        print("  level: normalization disabled")
+
+    ffmpeg_args = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(repl.source),
+        "-map_metadata",
+        "-1",
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+    ]
+    if audio_filter:
+        ffmpeg_args += ["-af", audio_filter]
+    ffmpeg_args += [
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        str(quality),
+        str(ogg_path),
+    ]
+    run_command(ffmpeg_args)
 
     run_command([str(ogg_tool), str(ogg_path), str(fsb_path)])
     if not fsb_path.exists() or fsb_path.stat().st_size < 64:
@@ -2175,26 +2548,29 @@ def extract_final_jukebox_path_ids(sharedassets_raw: bytes) -> list[int]:
     return [path_id for _, path_id in refs]
 
 
-def patch_resources_free_roam_playlist(
+def patch_resources_playlists(
     source_path: Path,
     jukebox_path_ids: list[int],
     mode: str = "full",
 ) -> tuple[bytes, dict]:
-    """Applique le mode stock, partial ou full au Free Roam."""
+    """Applique stock/full à toutes les MusicPlaylist de resources.assets."""
     mode = mode.lower().strip()
-    if mode not in {"stock", "partial", "full"}:
-        raise PatcherError(f"Unsupported FreeRoam playlist mode: {mode}")
+    if mode not in {"stock", "full"}:
+        raise PatcherError(f"Unsupported playlist mode: {mode}")
 
     raw = source_path.read_bytes()
     info = parse_unity_serialized_file(raw)
 
     MUSIC_PLAYLIST_SCRIPT_PATH_ID = 693
     SHAREDASSETS_FILE_ID = 3
-    EXPECTED_STOCK_FREE_ROAM = [(3, 436), (3, 435), (3, 434)]
+    EXPECTED_STOCK_PLAYLISTS = {
+        "Drift": [(3, 437)],
+        "FreeRoam": [(3, 436), (3, 435), (3, 434)],
+        "MainMenu": [(3, 433)],
+        "Racing": [(3, 438), (3, 432), (3, 439)],
+    }
 
-    candidate = None
-    old_parsed = None
-    old_payload = None
+    candidates: dict[str, tuple[object, tuple[str, int, list[tuple[int, int]], bytes], bytes]] = {}
     for obj in info.objects:
         start = info.data_offset + obj.byte_start
         payload = raw[start : start + obj.byte_size]
@@ -2204,22 +2580,20 @@ def patch_resources_free_roam_playlist(
         script_path_id = struct.unpack_from("<q", payload, 20)[0]
         if script_file_id != 1 or script_path_id != MUSIC_PLAYLIST_SCRIPT_PATH_ID:
             continue
+
         parsed = _parse_music_playlist_payload(payload)
-        if parsed is not None and parsed[0] == "FreeRoam":
-            if candidate is not None:
-                raise PatcherError("resources.assets contains multiple FreeRoam MusicPlaylist objects")
-            candidate = obj
-            old_parsed = parsed
-            old_payload = payload
+        if parsed is None:
+            continue
 
-    if candidate is None or old_parsed is None or old_payload is None:
-        raise PatcherError("Could not find the analysed FreeRoam MusicPlaylist in resources.assets")
+        name = parsed[0]
+        if name in candidates:
+            raise PatcherError(f"resources.assets contains multiple {name} MusicPlaylist objects")
+        candidates[name] = (obj, parsed, payload)
 
-    old_name, count_off, old_refs, tail = old_parsed
-    if old_refs != EXPECTED_STOCK_FREE_ROAM:
+    if set(candidates) != set(EXPECTED_STOCK_PLAYLISTS):
         raise PatcherError(
-            "resources.assets FreeRoam playlist no longer matches the analysed stock build: "
-            f"expected {EXPECTED_STOCK_FREE_ROAM}, got {old_refs}"
+            "resources.assets MusicPlaylist set no longer matches the analysed stock build: "
+            f"expected {sorted(EXPECTED_STOCK_PLAYLISTS)}, got {sorted(candidates)}"
         )
 
     if len(jukebox_path_ids) < 8:
@@ -2227,53 +2601,68 @@ def patch_resources_free_roam_playlist(
     if len(set(jukebox_path_ids)) != len(jukebox_path_ids):
         raise PatcherError("Final Jukebox contains duplicate MusicTrack PathIDs")
 
+    full_refs = [(SHAREDASSETS_FILE_ID, pid) for pid in jukebox_path_ids]
+    custom_count = max(0, len(jukebox_path_ids) - 8)
 
-    
+    playlist_reports: list[dict] = []
+    for name in ("Drift", "FreeRoam", "MainMenu", "Racing"):
+        obj, parsed, _ = candidates[name]
+        old_name, _, old_refs, _ = parsed
+        expected_refs = EXPECTED_STOCK_PLAYLISTS[name]
+        if old_refs != expected_refs:
+            raise PatcherError(
+                f"resources.assets {name} playlist no longer matches the analysed stock build: "
+                f"expected {expected_refs}, got {old_refs}"
+            )
 
-    custom_path_ids = jukebox_path_ids[8:]
+        new_refs = list(old_refs) if mode == "stock" else list(full_refs)
+        playlist_reports.append(
+            {
+                "playlist": old_name,
+                "path_id": obj.path_id,
+                "old_refs": old_refs,
+                "new_refs": new_refs,
+                "old_count": len(old_refs),
+                "new_count": len(new_refs),
+            }
+        )
 
-    if mode == "stock":
-        new_refs = list(old_refs)
-        policy_text = "stock FreeRoam unchanged: tracks 2/3/4 only"
-    elif mode == "partial":
-        new_refs = list(old_refs) + [(SHAREDASSETS_FILE_ID, pid) for pid in custom_path_ids]
-        policy_text = "stock tracks 2/3/4 + custom tracks; WARPED excluded"
-    else:
-        new_refs = [(SHAREDASSETS_FILE_ID, pid) for pid in jukebox_path_ids]
-        policy_text = "mirror final Jukebox; WARPED excluded"
-
-
-    # En mode stock, resources.assets doit rester strictement identique.
     if mode == "stock":
         return raw, {
-            "playlist": old_name,
-            "path_id": candidate.path_id,
             "mode": mode,
-            "old_refs": old_refs,
-            "new_refs": new_refs,
-            "old_count": len(old_refs),
-            "new_count": len(new_refs),
-            "custom_count": len(custom_path_ids),
             "changed": False,
-            "policy": policy_text,
+            "custom_count": custom_count,
+            "policy": "all stock playlists unchanged",
+            "playlists": playlist_reports,
         }
 
-    new_payload = (
-        old_payload[:count_off]
-        + p32(len(new_refs))
-        + b"".join(struct.pack("<iq", file_id, path_id) for file_id, path_id in new_refs)
-        + tail
-    )
+    replacements_by_pid: dict[int, bytes] = {}
+    for name in ("Drift", "FreeRoam", "MainMenu", "Racing"):
+        obj, parsed, old_payload = candidates[name]
+        _, count_off, _, tail = parsed
+        new_payload = (
+            old_payload[:count_off]
+            + p32(len(full_refs))
+            + b"".join(struct.pack("<iq", file_id, path_id) for file_id, path_id in full_refs)
+            + tail
+        )
+        replacements_by_pid[obj.path_id] = new_payload
 
     metadata = bytearray(raw[: info.data_offset])
     new_data = bytearray()
     old_by_pid = {o.path_id: o for o in info.objects}
+    changed_pids = set(replacements_by_pid)
+
     for obj in sorted(info.objects, key=lambda x: x.byte_start):
         new_start = _align(len(new_data), 16)
         if new_start > len(new_data):
             new_data.extend(b"\0" * (new_start - len(new_data)))
+
         old_abs = info.data_offset + obj.byte_start
-        payload = new_payload if obj.path_id == candidate.path_id else raw[old_abs : old_abs + obj.byte_size]
+        payload = replacements_by_pid.get(
+            obj.path_id,
+            raw[old_abs : old_abs + obj.byte_size],
+        )
         struct.pack_into("<q", metadata, obj.byte_start_field_offset, new_start)
         struct.pack_into("<I", metadata, obj.byte_size_field_offset, len(payload))
         new_data.extend(payload)
@@ -2285,6 +2674,7 @@ def patch_resources_free_roam_playlist(
     new_by_pid = {o.path_id: o for o in check.objects}
     if set(new_by_pid) != set(old_by_pid):
         raise PatcherError("resources.assets object table changed unexpectedly")
+
     for pid, before_obj in old_by_pid.items():
         after_obj = new_by_pid[pid]
         before = raw[
@@ -2295,18 +2685,21 @@ def patch_resources_free_roam_playlist(
             check.data_offset + after_obj.byte_start :
             check.data_offset + after_obj.byte_start + after_obj.byte_size
         ]
-        if pid != candidate.path_id and after != before:
+        if pid not in changed_pids and after != before:
             raise PatcherError(f"resources.assets safety check failed: untouched object PathID {pid} changed")
 
-    final_obj = new_by_pid[candidate.path_id]
-    final_payload = bytes(rebuilt[
-        check.data_offset + final_obj.byte_start :
-        check.data_offset + final_obj.byte_start + final_obj.byte_size
-    ])
-    final_parsed = _parse_music_playlist_payload(final_payload)
-    if final_parsed is None or final_parsed[0] != "FreeRoam" or final_parsed[2] != new_refs:
-        raise PatcherError("Final FreeRoam playlist validation failed")
+    for name in ("Drift", "FreeRoam", "MainMenu", "Racing"):
+        old_obj, _, _ = candidates[name]
+        final_obj = new_by_pid[old_obj.path_id]
+        final_payload = bytes(rebuilt[
+            check.data_offset + final_obj.byte_start :
+            check.data_offset + final_obj.byte_start + final_obj.byte_size
+        ])
+        final_parsed = _parse_music_playlist_payload(final_payload)
+        if final_parsed is None or final_parsed[0] != name or final_parsed[2] != full_refs:
+            raise PatcherError(f"Final {name} playlist validation failed")
 
+    # WARPED est un MusicTrack séparé dans resources.assets et ne doit jamais bouger.
     warped_obj = old_by_pid.get(5535)
     if warped_obj is not None:
         new_warped = new_by_pid[5535]
@@ -2322,16 +2715,11 @@ def patch_resources_free_roam_playlist(
             raise PatcherError("resources.assets safety check failed: WARPED MusicTrack changed")
 
     return bytes(rebuilt), {
-        "playlist": old_name,
-        "path_id": candidate.path_id,
         "mode": mode,
-        "old_refs": old_refs,
-        "new_refs": new_refs,
-        "old_count": len(old_refs),
-        "new_count": len(new_refs),
-        "custom_count": len(custom_path_ids),
         "changed": bytes(rebuilt) != raw,
-        "policy": policy_text,
+        "custom_count": custom_count,
+        "policy": "all playlists mirror final Jukebox; WARPED excluded",
+        "playlists": playlist_reports,
     }
 
 
@@ -2459,7 +2847,7 @@ def check_patch_files(
     sharedassets_path: Path,
     resources_path: Path,
     tracks_dir: Path,
-) -> dict[int, TrackReplacement]:
+) -> list[TrackReplacement]:
     if not master_bank.exists():
         raise PatcherError(
             f"Missing input file: {master_bank}\n"
@@ -2490,12 +2878,22 @@ def patch(
     master_bank: Path,
     sharedassets_path: Path,
     resources_path: Path,
-    input_replacements: dict[int, TrackReplacement],
+    input_replacements: list[TrackReplacement],
     output_dir: Path,
     ffmpeg: Path,
     ogg_tool: Path,
     config: dict,
 ) -> None:
+    fetch_metadata = bool(config.get("fetch_metadata", False))
+    normalization_mode = str(config.get("normalization_mode", "lufs")).lower()
+    target_lufs = float(config.get("target_lufs", -9.0))
+    true_peak = float(config.get("true_peak", -1.0))
+    target_peak_dbfs = float(config.get("target_peak_dbfs", 0.0))
+
+    for repl in input_replacements:
+        metadata = fetch_audio_metadata(repl.source, ffmpeg) if fetch_metadata else None
+        merge_track_metadata(repl, metadata)
+
     replacements, stock_replacements, custom_replacements, custom_input_map = resolve_track_layout(
         input_replacements
     )
@@ -2525,14 +2923,15 @@ def patch(
     policy = str(config.get("end_marker_policy", "full")).lower()
     padding_ms = int(config.get("timeline_padding_ms", 0))
     padding_samples = max(0, round(padding_ms * 48))
-    free_roam_mode = str(config.get("free_roam_playlist", "partial")).lower()
+    playlist_mode = str(config.get("playlist_mode", "full")).lower()
 
     patched_bank_metadata = bytearray(raw)
     manifest_tracks: list[dict] = []
     report_lines = [
         f"Heatwarped Music Patcher v{APP_VERSION}",
         f"Master.bank: {original_sha}",
-        f"Free Roam: {free_roam_mode}",
+        f"Playlists: {playlist_mode}",
+        f"Normalization: {normalization_mode}",
         f"Stock replaced: {len(stock_replacements)}",
         f"Custom added: {len(custom_replacements)}",
         "",
@@ -2552,7 +2951,17 @@ def patch(
                 label = f"{repl.artist} - {repl.title}" if repl.artist else repl.title
                 print(f"[{source_slot} -> {slot:02d}] custom <- {label}")
 
-            donor = build_donor_fsb(repl, ffmpeg, ogg_tool, quality, temp_dir)
+            donor = build_donor_fsb(
+                repl,
+                ffmpeg,
+                ogg_tool,
+                quality,
+                temp_dir,
+                normalization_mode,
+                target_lufs,
+                true_peak,
+                target_peak_dbfs,
+            )
 
             if slot in SLOT_BY_NUMBER:
                 slot_info = SLOT_BY_NUMBER[slot]
@@ -2616,6 +3025,12 @@ def patch(
                 )
                 fsb.samples.append(custom_sample)
                 custom_audio[slot] = (idx, donor, carbon_sample)
+
+    # Les slots stock non remplacés gardent leur gain d'origine.
+    # Seuls les remplacements 01-08 passent à 0 dB.
+    for slot in sorted(stock_replacements):
+        idx = SLOT_BY_NUMBER[slot]["sample_index"]
+        set_music_event_gain_db(patched_bank_metadata, timelines[idx].timeline_guid, 0.0)
 
     custom_graphs: dict[int, CustomEventGraph] = {}
     if custom_audio:
@@ -2800,18 +3215,21 @@ def patch(
         sharedassets_path, replacements, custom_graphs
     )
     final_jukebox_path_ids = extract_final_jukebox_path_ids(final_sharedassets)
-    final_resources, free_roam_report = patch_resources_free_roam_playlist(
-        resources_path, final_jukebox_path_ids, free_roam_mode
+    final_resources, playlist_report = patch_resources_playlists(
+        resources_path, final_jukebox_path_ids, playlist_mode
     )
     report_lines.extend(
         [
-            "Free Roam",
-            f"  mode: {free_roam_report['mode']}",
-            f"  tracks: {free_roam_report['old_count']} -> {free_roam_report['new_count']}",
-            f"  resources.assets changed: {free_roam_report['changed']}",
-            "",
+            "Playlists",
+            f"  mode: {playlist_report['mode']}",
+            f"  resources.assets changed: {playlist_report['changed']}",
         ]
     )
+    for playlist in playlist_report["playlists"]:
+        report_lines.append(
+            f"  {playlist['playlist']}: {playlist['old_count']} -> {playlist['new_count']} tracks"
+        )
+    report_lines.append("")
     ui_by_slot = {x["slot"]: x for x in ui_report}
     for track in manifest_tracks:
         track["unity_ui"] = ui_by_slot.get(track["slot"])
@@ -2837,17 +3255,20 @@ def patch(
         "output_sharedassets0_sha256": hashlib.sha256(final_sharedassets).hexdigest(),
         "input_resources_sha256": sha256_file(resources_path),
         "output_resources_sha256": hashlib.sha256(final_resources).hexdigest(),
-        "free_roam_playlist": free_roam_report,
+        "playlists": playlist_report,
         "slot_policy": {
-            "01-08": "stock replacement",
-            "09-99": "custom order, compacted to internal slots 10+",
+            "01-08": "first occurrence replaces stock; duplicates become first custom tracks",
+            "09-99": "custom order; duplicates kept and compacted to internal slots 10+",
             "unnumbered": "custom tracks appended after all numbered files",
             "WARPED": "protected",
         },
-        "custom_input_to_internal_slot": {
-            f"{k:02d}": v for k, v in sorted(custom_input_map.items())
-        },
-        "display_metadata_note": "01-08 replace stock tracks; 09-99 are compacted custom tracks; unnumbered audio files are appended last.",
+        "custom_input_to_internal_slot": custom_input_map,
+        "display_metadata_note": "First 01-08 occurrence replaces stock; duplicate 01-08 entries become first customs; duplicate 09-99 entries are kept; unnumbered audio is appended last.",
+        "normalization_mode": normalization_mode,
+        "target_lufs": target_lufs,
+        "true_peak": true_peak,
+        "target_peak_dbfs": target_peak_dbfs,
+        "fetch_metadata": fetch_metadata,
         "protected_track": {
             "slot": PROTECTED_MUSIC_SLOT["slot"],
             "base_sample": PROTECTED_MUSIC_SLOT["sample_name"],
@@ -2862,8 +3283,22 @@ def patch(
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
+    if normalization_mode == "lufs":
+        normalization_summary = f"LUFS ({target_lufs:g} LUFS / {true_peak:g} dBTP)"
+    elif normalization_mode == "peak":
+        normalization_summary = f"PEAK ({target_peak_dbfs:g} dBFS, boost only)"
+    else:
+        normalization_summary = "OFF"
+
     print()
     print("PATCH DONE")
+    print(f"  Stock replaced: {len(stock_replacements)}/8")
+    print(f"  Custom added: {len(custom_replacements)}")
+    print(f"  Total patched: {len(replacements)}")
+    print(f"  Normalization: {normalization_summary}")
+    print(f"  Metadata: {'ON' if fetch_metadata else 'OFF'}")
+    print(f"  Playlists: {playlist_mode.upper()}")
+    print()
     print(f"  {out_sharedassets}")
     print(f"  {out_resources}")
     print(f"  {out_bank}")
@@ -2884,10 +3319,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     p.add_argument(
-        "--free-roam",
-        choices=("stock", "partial", "full"),
+        "--playlists",
+        choices=("stock", "full"),
         default=None,
-        help="Override Free Roam mode for this run",
+        help="Override playlist mode for this run",
     )
     return p
 
@@ -2907,8 +3342,8 @@ def main() -> int:
         )
 
         config = load_config(args.config)
-        if args.free_roam is not None:
-            config["free_roam_playlist"] = args.free_roam
+        if args.playlists is not None:
+            config["playlist_mode"] = args.playlists
         patch(
             args.master,
             args.sharedassets,
