@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 # Avec PyInstaller --onefile, __file__ pointe vers le dossier temporaire.
 # On garde donc les dossiers du patcher a cote de l EXE.
@@ -40,8 +40,10 @@ DEFAULT_SHAREDASSETS = DEFAULT_INPUT_DIR / "sharedassets0.assets"
 DEFAULT_RESOURCES = DEFAULT_INPUT_DIR / "resources.assets"
 DEFAULT_TOOLS_DIR = SCRIPT_DIR / "tools"
 DEFAULT_CONFIG = SCRIPT_DIR / "config.json"
+IS_WINDOWS = os.name == "nt"
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+FFMPEG_GITHUB_API = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
 OGGVORBIS2FSB5_URL = (
     "https://github.com/uyjulian/oggvorbis2fsb5/releases/latest/download/"
     "oggvorbis2fsb5-win32.zip"
@@ -1587,27 +1589,116 @@ def load_config(path: Path) -> dict:
     return defaults
 
 
+def _download_urllib(url: str, destination: Path) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "HeatwarpedMusicPatcher/2.0"})
+    with urllib.request.urlopen(req, timeout=60) as r, destination.open("wb") as f:
+        total = int(r.headers.get("Content-Length", "0") or 0)
+        done = 0
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                print(f"\r    {done / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MiB", end="", flush=True)
+        if total:
+            print()
+
+
+def _download_curl(url: str, destination: Path) -> None:
+    curl = shutil.which("curl.exe") if IS_WINDOWS else shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl was not found")
+    result = subprocess.run(
+        [
+            curl,
+            "-L",
+            "--fail",
+            "--retry",
+            "2",
+            "--connect-timeout",
+            "30",
+            "--user-agent",
+            "HeatwarpedMusicPatcher/2.0",
+            "--output",
+            str(destination),
+            url,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stdout.strip() or f"curl exited with code {result.returncode}")
+
+
 def download(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "HeatwarpedMusicPatcher/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r, destination.open("wb") as f:
-            total = int(r.headers.get("Content-Length", "0") or 0)
-            done = 0
-            while True:
-                chunk = r.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if total:
-                    print(f"\r    {done / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MiB", end="", flush=True)
-            if total:
-                print()
-    except Exception as exc:
+        _download_urllib(url, destination)
+        return
+    except Exception as py_exc:
+        py_error = str(py_exc)
         destination.unlink(missing_ok=True)
-        raise PatcherError(f"Download failed: {url}\n{exc}") from exc
+        if not IS_WINDOWS:
+            raise PatcherError(f"Download failed: {url}\n{py_error}") from py_exc
+        print(f"Python HTTPS failed: {py_error}")
+        print("Retrying with Windows curl...")
+
+    try:
+        _download_curl(url, destination)
+    except Exception as curl_exc:
+        destination.unlink(missing_ok=True)
+        raise PatcherError(
+            f"Download failed: {url}\n"
+            f"Python HTTPS: {py_error}\n"
+            f"Windows curl: {curl_exc}"
+        ) from curl_exc
+
+
+def _read_url_text(url: str, temp_path: Path) -> str:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "HeatwarpedMusicPatcher/2.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.unlink(missing_ok=True)
+        _download_curl(url, temp_path)
+        try:
+            return temp_path.read_text(encoding="utf-8", errors="replace")
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+
+def resolve_ffmpeg_github_url(tools_dir: Path) -> str:
+    metadata_path = tools_dir / "_downloads" / "ffmpeg-github-release.json"
+    try:
+        payload = json.loads(_read_url_text(FFMPEG_GITHUB_API, metadata_path))
+    except Exception as exc:
+        raise PatcherError(f"Could not query the FFmpeg GitHub mirror: {exc}") from exc
+
+    assets = payload.get("assets") if isinstance(payload, dict) else None
+    if not isinstance(assets, list):
+        raise PatcherError("FFmpeg GitHub mirror returned an unexpected response")
+
+    candidates = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", ""))
+        url = asset.get("browser_download_url")
+        if isinstance(url, str) and name.casefold().endswith("-essentials_build.zip"):
+            candidates.append((name, url))
+
+    if not candidates:
+        raise PatcherError("Could not find an FFmpeg essentials ZIP in the latest GitHub release")
+    candidates.sort(key=lambda x: x[0].casefold())
+    return candidates[0][1]
 
 
 def extract_zip(zip_path: Path, destination: Path) -> None:
@@ -1632,7 +1723,19 @@ def find_executable(root: Path, names: set[str]) -> Optional[Path]:
 def install_ffmpeg(tools_dir: Path) -> Path:
     print("Downloading ffmpeg...")
     archive = tools_dir / "_downloads" / "ffmpeg-release-essentials.zip"
-    download(FFMPEG_URL, archive)
+    try:
+        download(FFMPEG_URL, archive)
+    except PatcherError as primary_exc:
+        print("Gyan download failed. Trying the GitHub mirror...")
+        try:
+            github_url = resolve_ffmpeg_github_url(tools_dir)
+            download(github_url, archive)
+        except PatcherError as mirror_exc:
+            raise PatcherError(
+                "Could not download ffmpeg from Gyan or its GitHub mirror.\n"
+                f"Gyan: {primary_exc}\n"
+                f"GitHub mirror: {mirror_exc}"
+            ) from mirror_exc
     extract_zip(archive, tools_dir / "ffmpeg")
     archive.unlink(missing_ok=True)
     exe = find_executable(tools_dir / "ffmpeg", {"ffmpeg.exe", "ffmpeg"})
