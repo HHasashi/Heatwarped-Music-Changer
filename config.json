@@ -12,10 +12,10 @@
   "vorbis_quality": 10,
   "end_marker_policy": "full",
   "timeline_padding_ms": 0,
-  "normalization_mode": "lufs",
+  "normalization_mode": "off",
   "target_lufs": -9.0,
   "true_peak": -1.0,
   "target_peak_dbfs": 0.0,
-  "fetch_metadata": true,
+  "fetch_metadata": false,
   "playlist_mode": "full"
 }
