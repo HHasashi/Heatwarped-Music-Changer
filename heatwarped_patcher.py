@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.0.1"
 
 # Avec PyInstaller --onefile, __file__ pointe vers le dossier temporaire.
 # On garde donc les dossiers du patcher a cote de l EXE.
