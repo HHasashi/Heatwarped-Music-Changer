@@ -1849,7 +1849,7 @@ def measure_loudnorm(
     target_lufs: float,
     true_peak: float,
 ) -> Optional[dict[str, float]]:
-    # Première passe loudnorm pour une normalisation LUFS reproductible.
+    # loudnorm sert uniquement à mesurer le LUFS et le true peak.
     output = run_command(
         [
             str(ffmpeg),
@@ -1917,25 +1917,34 @@ def build_donor_fsb(
     
     # Tout passe en Vorbis stéréo 48 kHz avant insertion.
     audio_filter: Optional[str] = None
+    measured: Optional[dict[str, float]] = None
+    lufs_gain_db: Optional[float] = None
 
     if normalization_mode == "lufs":
         measured = measure_loudnorm(repl.source, ffmpeg, target_lufs, true_peak)
         if measured is None:
             print("  level: LUFS unknown, unchanged")
         else:
-            print(
-                f"  level: {measured['input_i']:+.2f} LUFS -> {target_lufs:+.2f} LUFS "
-                f"(TP {true_peak:+.2f} dBTP)"
-            )
-            audio_filter = (
-                "aformat=sample_rates=48000:channel_layouts=stereo,"
-                f"loudnorm=I={target_lufs:.3f}:TP={true_peak:.3f}:LRA=11:"
-                f"measured_I={measured['input_i']:.6f}:"
-                f"measured_TP={measured['input_tp']:.6f}:"
-                f"measured_LRA={measured['input_lra']:.6f}:"
-                f"measured_thresh={measured['input_thresh']:.6f}:"
-                f"offset={measured['target_offset']:.6f}:linear=true:print_format=summary"
-            )
+            target_gain_db = target_lufs - measured["input_i"]
+            peak_safe_gain_db = true_peak - measured["input_tp"]
+            gain_db = min(target_gain_db, peak_safe_gain_db)
+            lufs_gain_db = gain_db
+            output_lufs = measured["input_i"] + gain_db
+            output_tp = measured["input_tp"] + gain_db
+
+            if peak_safe_gain_db < target_gain_db - 0.0001:
+                print(
+                    f"  level: {measured['input_i']:+.2f} LUFS -> {output_lufs:+.2f} LUFS "
+                    f"({gain_db:+.2f} dB, TP-limited at {output_tp:+.2f} dBTP)"
+                )
+            else:
+                print(
+                    f"  level: {measured['input_i']:+.2f} LUFS -> {output_lufs:+.2f} LUFS "
+                    f"({gain_db:+.2f} dB, TP {output_tp:+.2f} dBTP)"
+                )
+
+            if abs(gain_db) > 0.0001:
+                audio_filter = f"volume={gain_db:.6f}dB"
     elif normalization_mode == "peak":
         peak_db = measure_peak_db(repl.source, ffmpeg)
         boost_db = (
@@ -1956,32 +1965,63 @@ def build_donor_fsb(
     else:
         print("  level: normalization disabled")
 
-    ffmpeg_args = [
-        str(ffmpeg),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(repl.source),
-        "-map_metadata",
-        "-1",
-        "-vn",
-        "-ac",
-        "2",
-        "-ar",
-        "48000",
-    ]
-    if audio_filter:
-        ffmpeg_args += ["-af", audio_filter]
-    ffmpeg_args += [
-        "-c:a",
-        "libvorbis",
-        "-q:a",
-        str(quality),
-        str(ogg_path),
-    ]
-    run_command(ffmpeg_args)
+    def render_ogg(filter_value: Optional[str]) -> None:
+        ffmpeg_args = [
+            str(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(repl.source),
+            "-map_metadata",
+            "-1",
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+        ]
+        if filter_value:
+            ffmpeg_args += ["-af", filter_value]
+        ffmpeg_args += [
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            str(quality),
+            str(ogg_path),
+        ]
+        run_command(ffmpeg_args)
+
+    render_ogg(audio_filter)
+
+    # Vorbis peut recréer un peu de true peak. On corrige uniquement avec
+    # un gain fixe supplémentaire, jamais avec une normalisation dynamique.
+    if normalization_mode == "lufs" and measured is not None and lufs_gain_db is not None:
+        gain_db = lufs_gain_db
+
+        for _ in range(3):
+            encoded = measure_loudnorm(ogg_path, ffmpeg, target_lufs, true_peak)
+            if encoded is None or encoded["input_tp"] <= true_peak + 0.005:
+                break
+
+            correction_db = true_peak - encoded["input_tp"] - 0.05
+            gain_db += correction_db
+            audio_filter = f"volume={gain_db:.6f}dB" if abs(gain_db) > 0.0001 else None
+            print(f"  Vorbis TP correction: {correction_db:+.2f} dB")
+            render_ogg(audio_filter)
+
+        encoded = measure_loudnorm(ogg_path, ffmpeg, target_lufs, true_peak)
+        if encoded is not None:
+            if encoded["input_tp"] > true_peak + 0.01:
+                raise PatcherError(
+                    f"Could not keep encoded true peak under {true_peak:+.2f} dBTP "
+                    f"for {repl.source.name}"
+                )
+            print(
+                f"  final: {encoded['input_i']:+.2f} LUFS / "
+                f"{encoded['input_tp']:+.2f} dBTP"
+            )
 
     run_command([str(ogg_tool), str(ogg_path), str(fsb_path)])
     if not fsb_path.exists() or fsb_path.stat().st_size < 64:
