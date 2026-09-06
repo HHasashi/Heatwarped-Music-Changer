@@ -18,7 +18,7 @@ You can replace only the songs you want while leaving every other stock song unt
 - Avoid duplicated display names such as `Hangar 18 - Hangar 18`
 - Automatically remove common filename tags such as `Remaster`, `Remastered`, `Remix` and `Remixed`
 - LUFS, peak or no volume normalization
-- `stock` or `full` playlist mode for Drift, FreeRoam, MainMenu and Racing - allowing for those game modes to access any song and custom song
+- `stock`, `full` or `custom` playlist mode for Drift, FreeRoam, MainMenu and Racing - allowing for those game modes to access any song and custom song
 - Automatically convert supported audio files to the format required by the game
 - Offer to download missing FFmpeg / oggvorbis2fsb5 tools on first launch
 
@@ -83,12 +83,14 @@ The recommended filename format is:
 
 ```text
 NN - Artist - Title.extension
+NN. Artist - Title.extension
 ```
 
 Example:
 
 ```text
 01 - Avenged Sevenfold - Blinded in Chains.mp3
+4. Godfather Don - Status (Solo OG Home Demo).mp3
 ```
 
 But this format is **recommended, not required** anymore.
@@ -446,7 +448,8 @@ The patcher also validates that WARPED was not modified before writing the final
 
 # Playlist modes
 
-The old Free Roam-only `stock / partial / full` system has been replaced.
+I totally reworked the playlist system.
+I HIGHLY recommend you to read the associated README `README_PLAYLIST_CONFIG.txt`.
 
 The current option is:
 
@@ -454,11 +457,12 @@ The current option is:
 "playlist_mode": "full"
 ```
 
-There are only 2 modes:
+There are 3 modes:
 
 ```text
 stock
 full
+custom
 ```
 
 This setting applies to all 4 game MusicPlaylist objects handled by the patcher:
@@ -469,6 +473,11 @@ FreeRoam
 MainMenu
 Racing
 ```
+
+... or independently if you use the ```custom``` setting.
+
+Again, I HIGHLY recommend you to read the README associated.
+It also guides you into making your own NFS Underground 2 Soundtrack Mod (as a lot of you will use this mod for this).
 
 ## `stock`
 
@@ -516,6 +525,12 @@ or:
 "playlist_mode": "full"
 ```
 
+or:
+
+```json
+"playlist_mode": "custom"
+```
+
 If `05` exists, Sirens is replaced in both modes.
 
 In short:
@@ -534,7 +549,7 @@ controls the automatic game playlists
 
 # Playlist command line override
 
-You can override `playlist_mode` for one launch without editing `config.json`.
+You can override `playlist_mode` for one launch without editing `playlist_config.json`.
 
 Stock:
 
@@ -546,6 +561,12 @@ Full:
 
 ```text
 py -3 heatwarped_patcher.py --playlists full
+```
+
+Custom:
+
+```text
+py -3 heatwarped_patcher.py --playlists custom
 ```
 
 This only changes the current run.
@@ -645,8 +666,6 @@ Example `config.json`:
 {
   "_comment":
   [
-    "stock = keep all playlists unchanged",
-    "full = all 8 Telefon songs + all custom songs in every playlist",
     "normalization_mode = lufs, peak or off",
     "target_lufs and true_peak are used in lufs mode",
     "target_peak_dbfs is used in peak mode",
@@ -656,12 +675,11 @@ Example `config.json`:
   "vorbis_quality": 10,
   "end_marker_policy": "full",
   "timeline_padding_ms": 0,
-  "normalization_mode": "lufs",
+  "normalization_mode": "off",
   "target_lufs": -9.0,
   "true_peak": -1.0,
   "target_peak_dbfs": 0.0,
-  "fetch_metadata": true,
-  "playlist_mode": "full"
+  "fetch_metadata": true
 }
 ```
 
@@ -725,20 +743,34 @@ Enables Artist / Title tag reading and smart metadata fallback.
 
 Set it to `false` if you want the patcher to use filenames only.
 
-## `playlist_mode`
+
+Example `playlist_config.json`:
 
 ```json
-"playlist_mode": "full"
+{
+  "_comment": [
+    "playlist_mode = stock, full or custom",
+    "stock = keep the 4 original Heatwarped playlists unchanged",
+    "full = all 8 stock tracks + all custom tracks in every playlist",
+    "custom = use the track IDs listed below for each playlist",
+    "Track IDs 01-08 = stock tracks",
+    "Track ID 09 = WARPED, protected and not allowed in playlists",
+    "Track IDs 10+ = custom tracks in the final patcher order",
+    "In custom mode, all 4 playlists must contain at least one valid track ID"
+  ],
+
+  "playlist_mode": "custom",
+
+  "playlists": {
+    "MainMenu": [1, 2, 3, 4, 5, 6],
+    "Racing": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+    "Drift": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+    "FreeRoam": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+  }
+}
 ```
 
-Possible values:
-
-```text
-stock
-full
-```
-
-`full` is the default.
+This `playlist_config.json` creates a playlist like in NFS:U2 (`README_PLAYLIST_CONFIG.txt` for more details).
 
 ---
 
