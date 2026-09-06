@@ -21,6 +21,7 @@ You can replace only the songs you want while leaving every other stock song unt
 - `stock`, `full` or `custom` playlist mode for Drift, FreeRoam, MainMenu and Racing - allowing for those game modes to access any song and custom song
 - Automatically convert supported audio files to the format required by the game
 - Offer to download missing FFmpeg / oggvorbis2fsb5 tools on first launch
+- Randomizes tracks if you use the custom `winhttp.dll` and put it in the root folder of the game (keep a backup of this file!!)
 
 ---
 
