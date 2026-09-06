@@ -1,12 +1,11 @@
 {
-  "_comment": 
+  "_comment":
   [
-    "stock = keep all playlists unchanged",
-    "full = all 8 Telefon songs + all custom songs in every playlist",
     "normalization_mode = lufs, peak or off",
     "target_lufs and true_peak are used in lufs mode",
     "target_peak_dbfs is used in peak mode",
-    "off = no volume normalization"
+    "off = no volume normalization",
+    "Playlist settings are now in playlist_config.json"
   ],
 
   "vorbis_quality": 10,
@@ -16,6 +15,5 @@
   "target_lufs": -9.0,
   "true_peak": -1.0,
   "target_peak_dbfs": 0.0,
-  "fetch_metadata": false,
-  "playlist_mode": "full"
+  "fetch_metadata": true
 }

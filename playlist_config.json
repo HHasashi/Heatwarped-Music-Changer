@@ -1,0 +1,23 @@
+{
+  "_comment":
+  [
+    "playlist_mode = stock, full or custom",
+    "stock = keep the 4 original Heatwarped playlists unchanged",
+    "full = all 8 stock tracks + all custom tracks in every playlist",
+    "custom = use the track IDs listed below for each playlist",
+    "Track IDs 01-08 = stock tracks",
+    "Track ID 09 = WARPED, protected and not allowed in playlists",
+    "Track IDs 10+ = custom tracks in the final patcher order",
+    "In custom mode, all 4 playlists must contain at least one valid track ID"
+  ],
+
+  "playlist_mode": "full",
+
+  "playlists":
+  {
+    "MainMenu": [1, 2, 3, 4, 5, 6],
+    "Racing": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+    "Drift": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+    "FreeRoam": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+  }
+}
