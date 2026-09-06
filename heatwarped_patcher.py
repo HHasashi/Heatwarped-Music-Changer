@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Patcher de musiques pour Heatwarped.
 
-Format conseillé : NN - Artiste - Titre.ext
+Formats acceptés : NN - Artiste - Titre.ext ou NN. Artiste - Titre.ext
 01-08 remplacent les pistes du jeu, 09-99 ajoutent des pistes custom.
 Les fichiers audio sans numéro sont ajoutés à la fin.
 """
@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "3.0"
 
 # Avec PyInstaller --onefile, __file__ pointe vers le dossier temporaire.
 # On garde donc les dossiers du patcher a cote de l EXE.
@@ -40,6 +40,7 @@ DEFAULT_SHAREDASSETS = DEFAULT_INPUT_DIR / "sharedassets0.assets"
 DEFAULT_RESOURCES = DEFAULT_INPUT_DIR / "resources.assets"
 DEFAULT_TOOLS_DIR = SCRIPT_DIR / "tools"
 DEFAULT_CONFIG = SCRIPT_DIR / "config.json"
+DEFAULT_PLAYLIST_CONFIG = SCRIPT_DIR / "playlist_config.json"
 IS_WINDOWS = os.name == "nt"
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
@@ -49,6 +50,8 @@ OGGVORBIS2FSB5_URL = (
     "oggvorbis2fsb5-win32.zip"
 )
 
+# User-facing IDs 01-08 follow the actual Jukebox order seen in game.
+# sample_index/sample_name/event_path remain the physical FMOD targets.
 MUSIC_SLOTS = [
     {
         "slot": 1,
@@ -59,10 +62,10 @@ MUSIC_SLOTS = [
     },
     {
         "slot": 2,
-        "sample_index": 10,
-        "sample_name": "knifegirl",
-        "ui_key": "knifegirl",
-        "event_path": "event:/Music/knifegirl",
+        "sample_index": 45,
+        "sample_name": "midnight_stage",
+        "ui_key": "MidnightStage",
+        "event_path": "event:/Music/MidnightStage",
     },
     {
         "slot": 3,
@@ -73,17 +76,17 @@ MUSIC_SLOTS = [
     },
     {
         "slot": 4,
-        "sample_index": 45,
-        "sample_name": "midnight_stage",
-        "ui_key": "MidnightStage",
-        "event_path": "event:/Music/MidnightStage",
+        "sample_index": 10,
+        "sample_name": "knifegirl",
+        "ui_key": "knifegirl",
+        "event_path": "event:/Music/knifegirl",
     },
     {
         "slot": 5,
-        "sample_index": 50,
-        "sample_name": "sirens",
-        "ui_key": "Sirens",
-        "event_path": "event:/Music/Sirens",
+        "sample_index": 89,
+        "sample_name": "nightworld",
+        "ui_key": "nightworld",
+        "event_path": "event:/Music/nightworld",
     },
     {
         "slot": 6,
@@ -94,17 +97,17 @@ MUSIC_SLOTS = [
     },
     {
         "slot": 7,
-        "sample_index": 89,
-        "sample_name": "nightworld",
-        "ui_key": "nightworld",
-        "event_path": "event:/Music/nightworld",
-    },
-    {
-        "slot": 8,
         "sample_index": 97,
         "sample_name": "to_the_top",
         "ui_key": "ToTheTop",
         "event_path": "event:/Music/ToTheTop",
+    },
+    {
+        "slot": 8,
+        "sample_index": 50,
+        "sample_name": "sirens",
+        "ui_key": "Sirens",
+        "event_path": "event:/Music/Sirens",
     },
     {
         "slot": 9,
@@ -161,7 +164,7 @@ SUPPORTED_INPUT_EXTENSIONS = {
 }
 
 FILENAME_RE = re.compile(
-    r"^(?P<slot>\d{1,2})\s*-\s*(?P<artist>.+?)\s*-\s*(?P<title>.+)$"
+    r"^(?P<slot>\d{1,2})\s*(?:-|\.)\s*(?P<artist>.+?)\s*-\s*(?P<title>.+)$"
 )
 
 
@@ -1496,7 +1499,6 @@ def load_config(path: Path) -> dict:
         "vorbis_quality": 6,
         "end_marker_policy": "full",
         "timeline_padding_ms": 0,
-        "playlist_mode": "full",
         "normalization_mode": "lufs",
         "target_lufs": -9.0,
         "true_peak": -1.0,
@@ -1516,29 +1518,6 @@ def load_config(path: Path) -> dict:
             "config end_marker_policy must be: full, preserve_original, or preserve_tail"
         )
     defaults["end_marker_policy"] = policy
-
-    # Ancien config : stock reste stock, partial/full deviennent le nouveau full.
-    if "playlist_mode" in user:
-        raw_playlist_mode = user["playlist_mode"]
-    elif "free_roam_playlist" in user:
-        legacy_mode = str(user["free_roam_playlist"]).lower().strip()
-        raw_playlist_mode = "stock" if legacy_mode in {"stock", "none", "off", "disabled", "native"} else "full"
-    else:
-        raw_playlist_mode = "full"
-
-    playlist_mode = str(raw_playlist_mode).lower().strip()
-    playlist_aliases = {
-        "none": "stock",
-        "off": "stock",
-        "disabled": "stock",
-        "native": "stock",
-        "all": "full",
-        "unlocked": "full",
-    }
-    playlist_mode = playlist_aliases.get(playlist_mode, playlist_mode)
-    if playlist_mode not in {"stock", "full"}:
-        raise PatcherError("config playlist_mode must be: stock or full")
-    defaults["playlist_mode"] = playlist_mode
 
     # Nouveau système : LUFS ou peak. L'ancien normalize_tracks reste accepté
     # pour ne pas casser un ancien config.
@@ -1586,11 +1565,52 @@ def load_config(path: Path) -> dict:
     defaults["fetch_metadata"] = _config_bool(defaults.get("fetch_metadata", False), "fetch_metadata")
     defaults.pop("normalize_tracks", None)
     defaults.pop("free_roam_playlist", None)
+    defaults.pop("playlist_mode", None)
     return defaults
 
 
+def load_playlist_config(path: Path) -> dict:
+    defaults = {
+        "playlist_mode": "full",
+        "playlists": {
+            "Drift": [1, 2, 3, 4, 5, 6, 7, 8],
+            "FreeRoam": [1, 2, 3, 4, 5, 6, 7, 8],
+            "MainMenu": [1, 2, 3, 4, 5, 6, 7, 8],
+            "Racing": [1, 2, 3, 4, 5, 6, 7, 8],
+        },
+    }
+    if not path.exists():
+        return defaults
+    try:
+        user = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise PatcherError(f"Invalid playlist_config.json: {exc}") from exc
+    if not isinstance(user, dict):
+        raise PatcherError("playlist_config.json root must be a JSON object")
+
+    raw_mode = user.get("playlist_mode", "full")
+    mode = str(raw_mode).lower().strip()
+    aliases = {
+        "none": "stock",
+        "off": "stock",
+        "disabled": "stock",
+        "native": "stock",
+        "all": "full",
+        "unlocked": "full",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"stock", "full", "custom"}:
+        raise PatcherError("playlist_config playlist_mode must be: stock, full, or custom")
+
+    playlists = user.get("playlists", defaults["playlists"])
+    if not isinstance(playlists, dict):
+        raise PatcherError("playlist_config playlists must be a JSON object")
+
+    return {"playlist_mode": mode, "playlists": playlists}
+
+
 def _download_urllib(url: str, destination: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "HeatwarpedMusicPatcher/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": f"HeatwarpedMusicPatcher/{APP_VERSION}"})
     with urllib.request.urlopen(req, timeout=60) as r, destination.open("wb") as f:
         total = int(r.headers.get("Content-Length", "0") or 0)
         done = 0
@@ -1620,7 +1640,7 @@ def _download_curl(url: str, destination: Path) -> None:
             "--connect-timeout",
             "30",
             "--user-agent",
-            "HeatwarpedMusicPatcher/2.0",
+            f"HeatwarpedMusicPatcher/{APP_VERSION}",
             "--output",
             str(destination),
             url,
@@ -1662,7 +1682,7 @@ def download(url: str, destination: Path) -> None:
 
 def _read_url_text(url: str, temp_path: Path) -> str:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "HeatwarpedMusicPatcher/2.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": f"HeatwarpedMusicPatcher/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8", errors="replace")
     except Exception:
@@ -2691,14 +2711,122 @@ def extract_final_jukebox_path_ids(sharedassets_raw: bytes) -> list[int]:
     return [path_id for _, path_id in refs]
 
 
+def _playlist_track_id_map(
+    jukebox_path_ids: list[int],
+    custom_input_map: list[dict],
+) -> tuple[dict[int, int], list[int], list[dict]]:
+    if len(jukebox_path_ids) < 8:
+        raise PatcherError("Final Jukebox has fewer than the 8 stock MusicTracks")
+    if len(set(jukebox_path_ids)) != len(jukebox_path_ids):
+        raise PatcherError("Final Jukebox contains duplicate MusicTrack PathIDs")
+
+    custom_paths = jukebox_path_ids[8:]
+    if len(custom_paths) != len(custom_input_map):
+        raise PatcherError(
+            "Final Jukebox/custom input map mismatch: "
+            f"{len(custom_paths)} custom paths vs {len(custom_input_map)} custom tracks"
+        )
+
+    internal_to_path = {track_id: jukebox_path_ids[track_id - 1] for track_id in range(1, 9)}
+    for index, path_id in enumerate(custom_paths, start=10):
+        internal_to_path[index] = path_id
+
+    # IDs du playlist_config = IDs visibles par l'utilisateur.
+    # 01-08 restent les pistes stock. Un fichier 09.xxx garde l'ID 09 même
+    # si, en interne, le patcher le place dans le slot 10 pour laisser WARPED intact.
+    id_to_path = {track_id: internal_to_path[track_id] for track_id in range(1, 9)}
+    used_ids = set(id_to_path)
+    reserved_explicit = {
+        int(item["input_slot"])
+        for item in custom_input_map
+        if isinstance(item.get("input_slot"), int) and 9 <= int(item["input_slot"]) <= 99
+    }
+
+    custom_ids: list[int] = []
+    public_map: list[dict] = []
+    next_auto = 9
+
+    for item in sorted(custom_input_map, key=lambda x: int(x["internal_slot"])):
+        internal_slot = int(item["internal_slot"])
+        input_slot = item.get("input_slot")
+        public_id = None
+        automatic = False
+
+        if isinstance(input_slot, int) and 9 <= input_slot <= 99 and input_slot not in used_ids:
+            public_id = input_slot
+        else:
+            automatic = True
+            while next_auto in used_ids or next_auto in reserved_explicit:
+                next_auto += 1
+            public_id = next_auto
+            next_auto += 1
+
+        path_id = internal_to_path.get(internal_slot)
+        if path_id is None:
+            raise PatcherError(f"Missing Jukebox path for internal custom slot {internal_slot:02d}")
+
+        id_to_path[public_id] = path_id
+        used_ids.add(public_id)
+        custom_ids.append(public_id)
+        public_map.append({
+            "playlist_id": public_id,
+            "input_slot": input_slot,
+            "internal_slot": internal_slot,
+            "source": item.get("source"),
+            "automatic_id": automatic,
+        })
+
+    return id_to_path, custom_ids, public_map
+
+
+def _parse_custom_playlist_ids(
+    name: str,
+    raw_ids,
+    id_to_path: dict[int, int],
+) -> list[int]:
+    if not isinstance(raw_ids, list):
+        raise PatcherError(f"playlist_config {name} must be an array of track IDs")
+    if not raw_ids:
+        raise PatcherError(f"playlist_config {name} cannot be empty")
+
+    parsed: list[int] = []
+    seen: set[int] = set()
+    for value in raw_ids:
+        if isinstance(value, bool):
+            raise PatcherError(f"playlist_config {name} contains invalid track ID: {value}")
+        try:
+            track_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise PatcherError(f"playlist_config {name} contains invalid track ID: {value}") from exc
+
+        if isinstance(value, float) and not value.is_integer():
+            raise PatcherError(f"playlist_config {name} contains invalid track ID: {value}")
+        if isinstance(value, str) and value.strip() not in {str(track_id), f"{track_id:02d}"}:
+            raise PatcherError(f"playlist_config {name} contains invalid track ID: {value}")
+        if track_id not in id_to_path:
+            available = sorted(id_to_path)
+            pretty = ", ".join(f"{x:02d}" for x in available)
+            raise PatcherError(
+                f"playlist_config {name}: track ID {track_id:02d} is not available. "
+                f"Available IDs: {pretty}"
+            )
+        if track_id in seen:
+            raise PatcherError(f"playlist_config {name}: duplicate track ID {track_id:02d}")
+        seen.add(track_id)
+        parsed.append(track_id)
+
+    return parsed
+
+
 def patch_resources_playlists(
     source_path: Path,
     jukebox_path_ids: list[int],
-    mode: str = "full",
+    playlist_config: dict,
+    custom_input_map: list[dict],
 ) -> tuple[bytes, dict]:
-    """Applique stock/full à toutes les MusicPlaylist de resources.assets."""
-    mode = mode.lower().strip()
-    if mode not in {"stock", "full"}:
+    """Applique stock/full/custom aux quatre MusicPlaylist de resources.assets."""
+    mode = str(playlist_config.get("playlist_mode", "full")).lower().strip()
+    if mode not in {"stock", "full", "custom"}:
         raise PatcherError(f"Unsupported playlist mode: {mode}")
 
     raw = source_path.read_bytes()
@@ -2706,6 +2834,7 @@ def patch_resources_playlists(
 
     MUSIC_PLAYLIST_SCRIPT_PATH_ID = 693
     SHAREDASSETS_FILE_ID = 3
+    PLAYLIST_NAMES = ("Drift", "FreeRoam", "MainMenu", "Racing")
     EXPECTED_STOCK_PLAYLISTS = {
         "Drift": [(3, 437)],
         "FreeRoam": [(3, 436), (3, 435), (3, 434)],
@@ -2739,16 +2868,33 @@ def patch_resources_playlists(
             f"expected {sorted(EXPECTED_STOCK_PLAYLISTS)}, got {sorted(candidates)}"
         )
 
-    if len(jukebox_path_ids) < 8:
-        raise PatcherError("Final Jukebox has fewer than the 8 stock MusicTracks")
-    if len(set(jukebox_path_ids)) != len(jukebox_path_ids):
-        raise PatcherError("Final Jukebox contains duplicate MusicTrack PathIDs")
+    id_to_path, custom_ids, public_id_map = _playlist_track_id_map(
+        jukebox_path_ids, custom_input_map
+    )
+    full_track_ids = [*range(1, 9), *custom_ids]
+    full_refs = [(SHAREDASSETS_FILE_ID, id_to_path[track_id]) for track_id in full_track_ids]
+    custom_count = len(custom_ids)
 
-    full_refs = [(SHAREDASSETS_FILE_ID, pid) for pid in jukebox_path_ids]
-    custom_count = max(0, len(jukebox_path_ids) - 8)
+    configured = playlist_config.get("playlists", {})
+    if mode == "custom":
+        if not isinstance(configured, dict):
+            raise PatcherError("playlist_config playlists must be a JSON object")
+        missing = [name for name in PLAYLIST_NAMES if name not in configured]
+        extra = [name for name in configured if name not in PLAYLIST_NAMES]
+        if missing:
+            raise PatcherError(
+                "playlist_config custom mode is missing playlists: " + ", ".join(missing)
+            )
+        if extra:
+            raise PatcherError(
+                "playlist_config contains unknown playlists: " + ", ".join(sorted(extra))
+            )
 
+    target_ids: dict[str, list[int] | None] = {}
+    target_refs: dict[str, list[tuple[int, int]]] = {}
     playlist_reports: list[dict] = []
-    for name in ("Drift", "FreeRoam", "MainMenu", "Racing"):
+
+    for name in PLAYLIST_NAMES:
         obj, parsed, _ = candidates[name]
         old_name, _, old_refs, _ = parsed
         expected_refs = EXPECTED_STOCK_PLAYLISTS[name]
@@ -2758,11 +2904,23 @@ def patch_resources_playlists(
                 f"expected {expected_refs}, got {old_refs}"
             )
 
-        new_refs = list(old_refs) if mode == "stock" else list(full_refs)
+        if mode == "stock":
+            ids = None
+            new_refs = list(old_refs)
+        elif mode == "full":
+            ids = list(full_track_ids)
+            new_refs = list(full_refs)
+        else:
+            ids = _parse_custom_playlist_ids(name, configured[name], id_to_path)
+            new_refs = [(SHAREDASSETS_FILE_ID, id_to_path[track_id]) for track_id in ids]
+
+        target_ids[name] = ids
+        target_refs[name] = new_refs
         playlist_reports.append(
             {
                 "playlist": old_name,
                 "path_id": obj.path_id,
+                "track_ids": ids,
                 "old_refs": old_refs,
                 "new_refs": new_refs,
                 "old_count": len(old_refs),
@@ -2775,18 +2933,25 @@ def patch_resources_playlists(
             "mode": mode,
             "changed": False,
             "custom_count": custom_count,
+            "available_track_ids": full_track_ids,
+            "playlist_id_map": [
+                {"track_id": x["playlist_id"], "source": x["source"], "automatic_id": x["automatic_id"]}
+                for x in public_id_map
+            ],
+            "_internal_playlist_id_map": public_id_map,
             "policy": "all stock playlists unchanged",
             "playlists": playlist_reports,
         }
 
     replacements_by_pid: dict[int, bytes] = {}
-    for name in ("Drift", "FreeRoam", "MainMenu", "Racing"):
+    for name in PLAYLIST_NAMES:
         obj, parsed, old_payload = candidates[name]
         _, count_off, _, tail = parsed
+        refs = target_refs[name]
         new_payload = (
             old_payload[:count_off]
-            + p32(len(full_refs))
-            + b"".join(struct.pack("<iq", file_id, path_id) for file_id, path_id in full_refs)
+            + p32(len(refs))
+            + b"".join(struct.pack("<iq", file_id, path_id) for file_id, path_id in refs)
             + tail
         )
         replacements_by_pid[obj.path_id] = new_payload
@@ -2831,7 +2996,7 @@ def patch_resources_playlists(
         if pid not in changed_pids and after != before:
             raise PatcherError(f"resources.assets safety check failed: untouched object PathID {pid} changed")
 
-    for name in ("Drift", "FreeRoam", "MainMenu", "Racing"):
+    for name in PLAYLIST_NAMES:
         old_obj, _, _ = candidates[name]
         final_obj = new_by_pid[old_obj.path_id]
         final_payload = bytes(rebuilt[
@@ -2839,7 +3004,7 @@ def patch_resources_playlists(
             check.data_offset + final_obj.byte_start + final_obj.byte_size
         ])
         final_parsed = _parse_music_playlist_payload(final_payload)
-        if final_parsed is None or final_parsed[0] != name or final_parsed[2] != full_refs:
+        if final_parsed is None or final_parsed[0] != name or final_parsed[2] != target_refs[name]:
             raise PatcherError(f"Final {name} playlist validation failed")
 
     # WARPED est un MusicTrack séparé dans resources.assets et ne doit jamais bouger.
@@ -2857,11 +3022,22 @@ def patch_resources_playlists(
         if after_warped != before_warped:
             raise PatcherError("resources.assets safety check failed: WARPED MusicTrack changed")
 
+    policy = (
+        "all playlists use every available user track ID"
+        if mode == "full"
+        else "each playlist uses exactly the user track IDs from playlist_config"
+    )
     return bytes(rebuilt), {
         "mode": mode,
         "changed": bytes(rebuilt) != raw,
         "custom_count": custom_count,
-        "policy": "all playlists mirror final Jukebox; WARPED excluded",
+        "available_track_ids": full_track_ids,
+        "playlist_id_map": [
+            {"track_id": x["playlist_id"], "source": x["source"], "automatic_id": x["automatic_id"]}
+            for x in public_id_map
+        ],
+        "_internal_playlist_id_map": public_id_map,
+        "policy": policy,
         "playlists": playlist_reports,
     }
 
@@ -3026,6 +3202,7 @@ def patch(
     ffmpeg: Path,
     ogg_tool: Path,
     config: dict,
+    playlist_config: dict,
 ) -> None:
     fetch_metadata = bool(config.get("fetch_metadata", False))
     normalization_mode = str(config.get("normalization_mode", "lufs")).lower()
@@ -3066,7 +3243,7 @@ def patch(
     policy = str(config.get("end_marker_policy", "full")).lower()
     padding_ms = int(config.get("timeline_padding_ms", 0))
     padding_samples = max(0, round(padding_ms * 48))
-    playlist_mode = str(config.get("playlist_mode", "full")).lower()
+    playlist_mode = str(playlist_config.get("playlist_mode", "full")).lower()
 
     patched_bank_metadata = bytearray(raw)
     manifest_tracks: list[dict] = []
@@ -3312,7 +3489,7 @@ def patch(
     final_protected_sample = final_fsb.samples[protected_idx]
     if final_protected_sample != protected_original_sample:
         raise PatcherError(
-            "Final validation failed: protected slot 09 / WARPED changed. No output was written."
+            "Final validation failed: protected WARPED track changed. No output was written."
         )
     final_protected_timeline = final_stock_timelines[protected_idx]
     if (
@@ -3322,7 +3499,7 @@ def patch(
         or final_protected_timeline.old_end_positions != protected_original_timeline.old_end_positions
     ):
         raise PatcherError(
-            "Final validation failed: protected slot 09 / WARPED Timeline changed. No output was written."
+            "Final validation failed: protected WARPED Timeline changed. No output was written."
         )
 
     if custom_graphs:
@@ -3359,8 +3536,13 @@ def patch(
     )
     final_jukebox_path_ids = extract_final_jukebox_path_ids(final_sharedassets)
     final_resources, playlist_report = patch_resources_playlists(
-        resources_path, final_jukebox_path_ids, playlist_mode
+        resources_path, final_jukebox_path_ids, playlist_config, custom_input_map
     )
+    internal_playlist_id_map = playlist_report.pop("_internal_playlist_id_map", [])
+    public_id_by_internal = {
+        int(item["internal_slot"]): int(item["playlist_id"])
+        for item in internal_playlist_id_map
+    }
     report_lines.extend(
         [
             "Playlists",
@@ -3375,7 +3557,11 @@ def patch(
     report_lines.append("")
     ui_by_slot = {x["slot"]: x for x in ui_report}
     for track in manifest_tracks:
-        track["unity_ui"] = ui_by_slot.get(track["slot"])
+        internal_slot = int(track["slot"])
+        track["playlist_id"] = (
+            internal_slot if internal_slot <= 8 else public_id_by_internal[internal_slot]
+        )
+        track["unity_ui"] = ui_by_slot.get(internal_slot)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     game_data_dir = output_dir / "Heatwarped_Data"
@@ -3389,6 +3575,16 @@ def patch(
     out_resources = game_data_dir / "resources.assets"
     out_resources.write_bytes(final_resources)
 
+    public_tracks: list[dict] = []
+    for track in manifest_tracks:
+        public_track = dict(track)
+        public_track["track_id"] = public_track.pop("playlist_id")
+        public_track.pop("slot", None)
+        if public_track.get("unity_ui"):
+            public_track["unity_ui"] = dict(public_track["unity_ui"])
+            public_track["unity_ui"].pop("slot", None)
+        public_tracks.append(public_track)
+
     manifest = {
         "patcher": "Heatwarped Music Patcher",
         "version": APP_VERSION,
@@ -3399,13 +3595,12 @@ def patch(
         "input_resources_sha256": sha256_file(resources_path),
         "output_resources_sha256": hashlib.sha256(final_resources).hexdigest(),
         "playlists": playlist_report,
-        "slot_policy": {
-            "01-08": "first occurrence replaces stock; duplicates become first custom tracks",
-            "09-99": "custom order; duplicates kept and compacted to internal slots 10+",
-            "unnumbered": "custom tracks appended after all numbered files",
-            "WARPED": "protected",
+        "track_id_policy": {
+            "01-08": "stock track IDs / replacements",
+            "09-99": "custom filename IDs; use the exact same IDs in playlist_config.json",
+            "automatic": "duplicates or unnumbered custom files receive the next free user track ID",
         },
-        "custom_input_to_internal_slot": custom_input_map,
+        "playlist_id_map": playlist_report.get("playlist_id_map", []),
         "display_metadata_note": "First 01-08 occurrence replaces stock; duplicate 01-08 entries become first customs; duplicate 09-99 entries are kept; unnumbered audio is appended last.",
         "normalization_mode": normalization_mode,
         "target_lufs": target_lufs,
@@ -3413,13 +3608,12 @@ def patch(
         "target_peak_dbfs": target_peak_dbfs,
         "fetch_metadata": fetch_metadata,
         "protected_track": {
-            "slot": PROTECTED_MUSIC_SLOT["slot"],
             "base_sample": PROTECTED_MUSIC_SLOT["sample_name"],
             "fsb_sample_index": PROTECTED_MUSIC_SLOT["sample_index"],
             "event_path": PROTECTED_MUSIC_SLOT["event_path"],
             "policy": "protected",
         },
-        "tracks": sorted(manifest_tracks, key=lambda x: x["slot"]),
+        "tracks": sorted(public_tracks, key=lambda x: x["track_id"]),
     }
     manifest_path = output_dir / "track_manifest.json"
     report_path = output_dir / "patch_report.txt"
@@ -3461,9 +3655,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--tools", type=Path, default=DEFAULT_TOOLS_DIR)
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    p.add_argument("--playlist-config", type=Path, default=DEFAULT_PLAYLIST_CONFIG)
     p.add_argument(
         "--playlists",
-        choices=("stock", "full"),
+        choices=("stock", "full", "custom"),
         default=None,
         help="Override playlist mode for this run",
     )
@@ -3485,8 +3680,9 @@ def main() -> int:
         )
 
         config = load_config(args.config)
+        playlist_config = load_playlist_config(args.playlist_config)
         if args.playlists is not None:
-            config["playlist_mode"] = args.playlists
+            playlist_config["playlist_mode"] = args.playlists
         patch(
             args.master,
             args.sharedassets,
@@ -3496,6 +3692,7 @@ def main() -> int:
             ffmpeg,
             ogg_tool,
             config,
+            playlist_config,
         )
         return 0
     except PatcherError as exc:
